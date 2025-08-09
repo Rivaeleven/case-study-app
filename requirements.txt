@@ -1,0 +1,9 @@
+Flask==3.0.3
+openai==1.35.7
+youtube-transcript-api==0.6.2
+weasyprint==62.3
+Jinja2==3.1.4
+pydantic==2.8.2
+python-dotenv==1.0.1
+requests==2.32.3
+gunicorn==22.0.0
