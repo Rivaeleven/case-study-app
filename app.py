@@ -6,8 +6,10 @@ from flask import Flask, request, render_template_string, send_file
 from youtube_transcript_api import YouTubeTranscriptApi
 from jinja2 import Template
 from pydantic import BaseModel, Field
-from weasyprint import HTML
 import requests
+
+# NOTE: WeasyPrint is lazily imported inside PDF generation to avoid boot-time failures
+# on platforms missing system libraries until runtime.
 
 # ---- OpenAI v1 SDK ----
 from openai import OpenAI
@@ -358,18 +360,29 @@ def build_case_study(url: str, overrides: Optional[Dict[str, str]] = None) -> st
     except Exception:
         pass
 
-    # 3) HTML → PDF
-    heading = f"{naming.agency} – {naming.product} – {naming.campaign} – {naming.commercial} – {naming.director}"
-    html = PDF_HTML.render(
-        file_title=naming.filename().replace(".pdf", ""),
-        heading=heading,
-        naming=naming,
-        body_html=body_html,
-        url=url,
-    )
-    pdf_path = os.path.join(OUT_DIR, naming.filename())
-    HTML(string=html).write_pdf(pdf_path)
-    return pdf_path
+    # 3) HTML → PDF (lazy-import WeasyPrint to avoid boot failures)
+    try:
+        from weasyprint import HTML as WPHTML  # type: ignore
+        heading = f"{naming.agency} – {naming.product} – {naming.campaign} – {naming.commercial} – {naming.director}"
+        html = PDF_HTML.render(
+            file_title=naming.filename().replace(".pdf", ""),
+            heading=heading,
+            naming=naming,
+            body_html=body_html,
+            url=url,
+        )
+        pdf_path = os.path.join(OUT_DIR, naming.filename())
+        WPHTML(string=html).write_pdf(pdf_path)
+        return pdf_path
+    except Exception as e:
+        # If PDF render fails (missing libs), write HTML to disk for debugging
+        fallback_path = os.path.join(OUT_DIR, naming.filename().replace('.pdf', '.html'))
+        try:
+            with open(fallback_path, 'w', encoding='utf-8') as f:
+                f.write(body_html)
+        except Exception:
+            pass
+        raise e
 
 # ----------------- Minimal UI -----------------
 INDEX_HTML = """
