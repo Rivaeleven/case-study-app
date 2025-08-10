@@ -8,24 +8,22 @@ from jinja2 import Template
 from pydantic import BaseModel, Field
 import requests
 
-# ---------- ENV ----------
+# ───────────────────────── ENV ─────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # safe default
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # accurate, available
 OUT_DIR = os.getenv("OUT_DIR", "out")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# ---------- OpenAI (lazy) ----------
+# ───────────────────── OpenAI (lazy) ───────────────────
 from openai import OpenAI
 
 def get_client():
-    # Lazy initialization so the app can boot even if the key is missing;
-    # requests will fail gracefully at call time instead of import time.
-    return OpenAI()
+    return OpenAI()  # reads OPENAI_API_KEY from env
 
-# ---------- Flask ----------
+# ───────────────────────── APP ─────────────────────────
 app = Flask(__name__)
 
-# ---------- Utilities ----------
+# ────────────────────── Utilities ──────────────────────
 def video_id_from_url(url: str) -> str:
     q = urlparse(url)
     if q.hostname in ("youtu.be",):
@@ -75,14 +73,13 @@ def fetch_transcript_segments(video_id: str) -> List[Dict]:
     except Exception:
         return []
 
-# ---------- Naming ----------
+# ────────────────────── Naming model ───────────────────
 class Naming(BaseModel):
     agency: str = Field("Unknown")
     product: str = Field("Unknown")
     campaign: str = Field("Unknown")
     commercial: str = Field("Unknown")
     director: str = Field("Unknown")
-
     def filename(self) -> str:
         return (
             f"{safe_token(self.agency)}-"
@@ -92,67 +89,71 @@ class Naming(BaseModel):
             f"{safe_token(self.director)}.pdf"
         )
 
-# ---------- Prompts ----------
-ANALYSIS_SYSTEM = """
-You are a creative ad analyst. Produce a rigorous, concrete breakdown of a TVC/online video ad.
-
-OUTPUT A (for humans): VALID HTML only (no Markdown). Use semantic tags (<h2>, <ol>, <ul>, <table>, <p>).
-Sections (exact titles as <h2>):
-1. Scene-by-Scene Description (Timecoded)
-   - Use an ordered list. For each beat: [mm:ss], WHAT WE SEE (framing/camera/mise-en-scène), WHAT WE HEAR (dialog/VO/SFX/music), any on-screen text/supers, and the narrative purpose.
-2. Annotated Script
-   - Provide an HTML <table> with headers: Time | Script (verbatim) | Director’s Notes | Brand/Strategy Note.
-   - Director’s Notes: shot type (WS/MS/CU/ECU), movement (lock-off, push-in, handheld), pacing; notable color/light/composition.
-   - Brand/Strategy Note: how this beat serves message, product role, or distinctive brand asset.
-3. What Makes It Compelling & Unique
-4. Creative Strategy Applied
-5. Campaign Objectives, Execution & Reach (2-column HTML table)
-6. Performance & Audience Impact (real quant if present; otherwise label as 'indicative')
-7. Why It’s Award‑Worthy
-8. Core Insight (The 'Big Idea')
-
-Rules: Prefer precise, observable details over adjectives. Use [inferred] when you add connective tissue beyond transcript.
-Also output a single hyperlink at the end back to the YouTube URL.
-""".strip()
-
+# ─────────────────────── Prompts ───────────────────────
 NAMING_SYSTEM = """
-Extract (or reasonably infer) the following fields for naming:
-- Agency, Product, Campaign, Commercial, Director.
+Extract (or infer cautiously) the work's naming fields:
+- Agency (creative agency behind the commercial)
+- Product (brand/product)
+- Campaign (campaign/series name if stated; else 'Unknown')
+- Commercial (spot title; default to video title if unclear)
+- Director (if known in video or description; else 'Unknown')
 Return ONLY compact JSON with keys: agency, product, campaign, commercial, director.
-Be conservative with proper nouns. If uncertain, use 'Unknown'.
+Be conservative; if a proper noun is uncertain, use 'Unknown'.
 """.strip()
 
 STRUCTURED_JSON_SPEC = """
-Produce ONLY a JSON object with these top-level keys:
+You will receive a YouTube URL, title, channel, and a timecoded transcript. 
+Return ONLY a STRICT JSON object (no markdown) with keys:
+
 {
   "video": {"url": string, "title": string, "channel": string},
+  "naming": {"agency": string, "product": string, "campaign": string, "commercial": string, "director": string},
   "scenes": [
     {
       "start": "mm:ss",
-      "end": "mm:ss",
-      "visual": string,
-      "audio": string,
-      "on_screen_text": [string],
-      "purpose": string
+      "end": "mm:ss" | null,
+      "visual": string,             # WHAT WE SEE (framing/action/mise-en-scène)
+      "audio": string,              # WHAT WE HEAR (dialog/VO/SFX/music) – quote verbatim if in transcript
+      "on_screen_text": [string],   # exact supers/lower-thirds if present
+      "purpose": string             # narrative/strategic purpose of the beat
     }
   ],
   "script": [
     {
       "time": "mm:ss",
-      "speaker": string|null,
-      "line": string,
-      "directors_notes": string,
-      "strategy_note": string
+      "speaker": string | null,     # e.g., "VO", "Woman", "Crowd"
+      "line": string,               # verbatim if in transcript; add ' [inferred]' if not verbatim
+      "directors_notes": string,    # shot type (WS/MS/CU/ECU), movement (lock-off, push-in, handheld), pacing, notable color/light/composition
+      "strategy_note": string       # how this beat lands message/product/brand
     }
   ],
   "brand": {
     "product": string,
-    "distinctive_assets": [string],
+    "distinctive_assets": [string], # pack, color, mnemonic, sonic logo
     "claims": [string],
     "ctas": [string]
   }
 }
-Rules: return STRICT JSON (no trailing commas, no comments, no markdown). Use values from transcript where possible; if you must infer, append ' [inferred]'.
+
+Rules:
+- Anchor timestamps to the provided timecoded transcript; use mm:ss.
+- Do NOT invent lines; use transcript verbatim where possible. If you need connective tissue, append ' [inferred]'.
+- If the transcript lacks on-screen text/supers, use an empty array.
+- Keep strings concise and concrete.
+""".strip()
+
+ANALYSIS_FROM_JSON = """
+You will receive a JSON describing scenes and script extracted from a YouTube ad, plus the plain transcript text.
+Write VALID HTML (no markdown) for the following sections ONLY, drawing facts strictly from the JSON/transcript. 
+If you deduce something, mark it [inferred]. Use precise language and avoid generic adjectives.
+
+Sections:
+<h2>What Makes It Compelling & Unique</h2>
+<h2>Creative Strategy Applied</h2>
+<h2>Campaign Objectives, Execution & Reach</h2>  <!-- 2-column HTML table -->
+<h2>Performance & Audience Impact</h2>           <!-- note if metrics are not public -->
+<h2>Why It’s Award‑Worthy</h2>
+<h2>Core Insight (The 'Big Idea')</h2>
 """.strip()
 
 ANALYSIS_USER_TEMPLATE = Template(
@@ -164,24 +165,10 @@ Timecoded transcript (first lines):
 {{ timecoded }}
 
 Plain transcript (may be partial):
-{{ transcript }}
-
-Instructions:
-- Use the timecoded lines to anchor each beat and script quotes.
-- Quote dialogue/VO verbatim where possible; mark any fabricated bridging lines as [inferred].
-- If on-screen text/supers appear, capture them verbatim and timecode them."""
+{{ transcript }}"""
 )
 
-# ---------- LLM Helpers ----------
-def llm_html(system: str, user: str) -> str:
-    client = get_client()
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        temperature=0.5,
-    )
-    return (resp.choices[0].message.content or "").strip()
-
+# ───────────────────── LLM Helpers ─────────────────────
 def llm_json(system: str, user: str) -> Dict:
     client = get_client()
     resp = client.chat.completions.create(
@@ -198,7 +185,6 @@ def llm_json(system: str, user: str) -> Dict:
 
 def llm_json_structured(system: str, user: str) -> Dict:
     client = get_client()
-    # Try strict JSON mode first
     try:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -208,7 +194,7 @@ def llm_json_structured(system: str, user: str) -> Dict:
         )
         return json.loads(resp.choices[0].message.content or "{}")
     except Exception:
-        # Fallback: best-effort JSON extraction
+        # Fallback: normal mode + best-effort JSON extraction
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -221,7 +207,20 @@ def llm_json_structured(system: str, user: str) -> Dict:
         except Exception:
             return {}
 
-# ---------- HTML Templates ----------
+def llm_html_from_json(system: str, json_payload: Dict, transcript_text: str) -> str:
+    client = get_client()
+    user_blob = json.dumps({"json": json_payload, "transcript": transcript_text}, ensure_ascii=False)
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_blob},
+        ],
+        temperature=0.4,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+# ─────────────────── HTML Templates ────────────────────
 PDF_HTML = Template("""
 <!doctype html>
 <html>
@@ -238,6 +237,7 @@ PDF_HTML = Template("""
     th, td { border:1px solid #e5e7eb; padding:8px; vertical-align:top }
     .ref { margin-top:18px; font-size:10pt; color:#374151 }
     ol { padding-left: 18px; }
+    .pill { display:inline-block; background:#f3f4f6; padding:2px 8px; border-radius:999px; font-size:10pt; margin-left:6px; }
   </style>
 </head>
 <body>
@@ -250,7 +250,41 @@ PDF_HTML = Template("""
     <strong>Director:</strong> {{ naming.director }}
   </div>
   <hr/>
-  {{ body_html | safe }}
+
+  <h2>Scene-by-Scene Description (Timecoded)</h2>
+  <ol>
+    {% for sc in scenes %}
+      <li>
+        <strong>[{{ sc.start }}{% if sc.end %}–{{ sc.end }}{% endif %}]</strong>
+        <div><em>What we see:</em> {{ sc.visual }}</div>
+        <div><em>What we hear:</em> {{ sc.audio }}</div>
+        {% if sc.on_screen_text and sc.on_screen_text|length %}
+          <div><em>On-screen text:</em> {{ ", ".join(sc.on_screen_text) }}</div>
+        {% endif %}
+        <div><em>Purpose:</em> {{ sc.purpose }}</div>
+      </li>
+    {% endfor %}
+  </ol>
+
+  <h2>Annotated Script</h2>
+  <table>
+    <thead>
+      <tr><th>Time</th><th>Script (verbatim)</th><th>Director’s Notes</th><th>Brand/Strategy Note</th></tr>
+    </thead>
+    <tbody>
+      {% for line in script %}
+      <tr>
+        <td>{{ line.time }}</td>
+        <td>{{ line.line }}</td>
+        <td>{{ line.directors_notes }}</td>
+        <td>{{ line.strategy_note }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {{ analysis_html | safe }}
+
   <div class="ref"><strong>Reference:</strong> <a href="{{ url }}">{{ url }}</a></div>
 </body>
 </html>
@@ -270,14 +304,13 @@ INDEX_HTML = """
     input[type=text] { width:100%; padding:10px 12px; border:1px solid #d1d5db; border-radius:10px; font-size:15px; }
     .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); gap: 10px; }
     .btn { background:#111827; color:#fff; border:none; padding: 10px 14px; border-radius: 10px; cursor:pointer; }
-    .btn:disabled { opacity:.5; cursor:not-allowed; }
     .muted { color:#6b7280; font-size: 13px; }
   </style>
 </head>
 <body>
   <div class="card">
     <h2>YouTube → Case Study PDF</h2>
-    <p class="muted">Paste a YouTube URL. Optionally provide naming overrides. We’ll return a PDF (and save a JSON sidecar) named <code>Agency-Product-Campaign_Commercial-Director.pdf</code>.</p>
+    <p class="muted">Paste a YouTube URL. Optionally provide naming overrides. We’ll return a PDF and save a JSON sidecar named <code>Agency-Product-Campaign_Commercial-Director.json</code>.</p>
     <form method="post" action="/generate">
       <label>YouTube URL</label>
       <input name="url" type="text" placeholder="https://www.youtube.com/watch?v=..." required />
@@ -295,62 +328,74 @@ INDEX_HTML = """
 </html>
 """
 
-# ---------- Core builder ----------
+# ─────────────────── Builder pipeline ──────────────────
 def build_case_study(url: str, overrides: Optional[Dict[str, str]] = None) -> str:
     vid = video_id_from_url(url)
     meta = fetch_basic_metadata(vid)
-
     segments = fetch_transcript_segments(vid)
-    timecoded = "\n".join(
-        f"{_format_time(s['start'])}  {s['text']}" for s in segments[:150]
-    )
-    transcript = " ".join(s["text"] for s in segments)[:12000]
+    timecoded = "\n".join(f"{_format_time(s['start'])}  {s['text']}" for s in segments[:180])
+    transcript_text = " ".join(s["text"] for s in segments)[:16000]
 
     user_block = ANALYSIS_USER_TEMPLATE.render(
-        url=url, title=meta.get("title", ""), author=meta.get("author", ""),
-        timecoded=timecoded, transcript=transcript
+        url=url, title=meta.get("title",""), author=meta.get("author",""),
+        timecoded=timecoded, transcript=transcript_text
     )
 
-    # Naming (with optional overrides)
+    # 1) Naming (cautious) + overrides
     raw_naming = llm_json(NAMING_SYSTEM, user_block) or {}
     overrides = overrides or {}
-    raw_naming.update({k: v for k, v in overrides.items() if v})
+    raw_naming.update({k:v for k,v in overrides.items() if v})
     naming = Naming(
-        agency=raw_naming.get("agency", "Unknown"),
-        product=raw_naming.get("product", "Unknown"),
-        campaign=raw_naming.get("campaign", "Unknown"),
-        commercial=raw_naming.get("commercial", meta.get("title", "Unknown")),
-        director=raw_naming.get("director", "Unknown"),
+        agency=raw_naming.get("agency","Unknown"),
+        product=raw_naming.get("product","Unknown"),
+        campaign=raw_naming.get("campaign","Unknown"),
+        commercial=raw_naming.get("commercial", meta.get("title","Unknown")),
+        director=raw_naming.get("director","Unknown"),
     )
 
-    # Human-readable HTML body
-    body_html = llm_html(ANALYSIS_SYSTEM, user_block)
+    # 2) Structured JSON (scenes + script + brand)
+    json_payload = llm_json_structured(STRUCTURED_JSON_SPEC, user_block)
+    # Ensure required keys exist
+    json_payload.setdefault("video", {"url": url, "title": meta.get("title",""), "channel": meta.get("author","")})
+    json_payload.setdefault("naming", {
+        "agency": naming.agency, "product": naming.product, "campaign": naming.campaign,
+        "commercial": naming.commercial, "director": naming.director
+    })
+    json_payload.setdefault("scenes", [])
+    json_payload.setdefault("script", [])
+    json_payload.setdefault("brand", {
+        "product": naming.product, "distinctive_assets": [], "claims": [], "ctas": []
+    })
 
-    # Machine-readable JSON sidecar
-    json_obj = llm_json_structured(STRUCTURED_JSON_SPEC, user_block)
-    json_path = os.path.join(OUT_DIR, naming.filename().replace(".pdf", ".json"))
+    # 3) Analysis sections strictly from JSON + transcript
+    analysis_html = llm_html_from_json(ANALYSIS_FROM_JSON, json_payload, transcript_text)
+
+    # Save sidecar JSON
+    json_path = os.path.join(OUT_DIR, Naming(**json_payload["naming"]).filename().replace(".pdf", ".json"))
     try:
         with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(json_obj, f, ensure_ascii=False, indent=2)
+            json.dump(json_payload, f, ensure_ascii=False, indent=2)
     except Exception:
-        pass  # don't block PDF if JSON write fails
+        pass
 
-    # Render PDF (lazy import WeasyPrint to avoid boot issues)
+    # 4) Render PDF from JSON (lazy WeasyPrint import)
     from weasyprint import HTML as WEASY_HTML
 
     heading = f"{naming.agency} – {naming.product} – {naming.campaign} – {naming.commercial} – {naming.director}"
     html = PDF_HTML.render(
-        file_title=naming.filename().replace(".pdf", ""),
+        file_title=naming.filename().replace(".pdf",""),
         heading=heading,
         naming=naming,
-        body_html=body_html,
+        scenes=json_payload["scenes"],
+        script=json_payload["script"],
+        analysis_html=analysis_html,
         url=url,
     )
     pdf_path = os.path.join(OUT_DIR, naming.filename())
     WEASY_HTML(string=html).write_pdf(pdf_path)
     return pdf_path
 
-# ---------- Routes ----------
+# ─────────────────────── Routes ────────────────────────
 @app.get("/health")
 def health():
     return "ok", 200
@@ -373,10 +418,8 @@ def generate():
         pdf_path = build_case_study(url, overrides=overrides)
         return send_file(pdf_path, as_attachment=True, download_name=os.path.basename(pdf_path))
     except Exception as e:
-        # Fail noisily but informatively
         return f"<pre>Error: {e}</pre>", 400
 
 if __name__ == "__main__":
-    # Local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
 
