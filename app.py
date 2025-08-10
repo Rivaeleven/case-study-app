@@ -14,8 +14,8 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
 OUT_DIR = os.getenv("OUT_DIR", "out")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-import openai
-openai.api_key = OPENAI_API_KEY
+from openai import OpenAI
+client = OpenAI()  # reads OPENAI_API_KEY from env
 
 app = Flask(__name__)
 
@@ -100,26 +100,31 @@ ANALYSIS_USER_TEMPLATE = Template(
 )
 
 def llm_json(system: str, user: str) -> Dict:
-    resp = openai.ChatCompletion.create(
+    resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
         temperature=0.2,
     )
-    txt = resp.choices[0].message["content"]
+    txt = resp.choices[0].message.content or ""
     try:
-        start = txt.find("{")
-        end = txt.rfind("}")
-        return json.loads(txt[start : end + 1])
+        start = txt.find("{"); end = txt.rfind("}")
+        return json.loads(txt[start:end+1])
     except Exception:
         return {}
 
 def llm_text(system: str, user: str) -> str:
-    resp = openai.ChatCompletion.create(
+    resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
         temperature=0.5,
     )
-    return resp.choices[0].message["content"].strip()
+    return (resp.choices[0].message.content or "").strip()
 
 PDF_HTML = Template(
     """
