@@ -13,4 +13,5 @@ COPY . .
 ENV PORT=8080 PYTHONUNBUFFERED=1 OUT_DIR=/tmp/out
 RUN mkdir -p $OUT_DIR
 EXPOSE 8080
-CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:8080", "app:app", "--timeout", "120"]
+CMD ["bash","-lc","gunicorn -w 2 -b 0.0.0.0:$PORT app:app --timeout 300"]
+

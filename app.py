@@ -9,8 +9,10 @@ from pydantic import BaseModel, Field
 import requests
 
 # ───────────────────────── ENV ─────────────────────────
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")   # default to GPT‑5
-OUT_DIR = os.getenv("OUT_DIR", "out")
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-5")  # default to GPT‑5 (you confirmed access)
+OUT_DIR        = os.getenv("OUT_DIR", "out")
+MAX_TOKENS     = int(os.getenv("MAX_TOKENS", "2000"))  # allow longer answers for accuracy
+REPAIR_PASSES  = int(os.getenv("REPAIR_PASSES", "2"))  # up to 2 repair attempts
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # ───────────────────── OpenAI (lazy) ───────────────────
@@ -154,16 +156,17 @@ Plain transcript (may be partial):
 # ───────────────────── LLM Helpers ─────────────────────
 def llm_json(system: str, user: str) -> Dict:
     client = get_client()
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-    )
-    txt = resp.choices[0].message.content or ""
     try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            max_tokens=MAX_TOKENS,
+        )
+        txt = resp.choices[0].message.content or ""
         start = txt.find("{"); end = txt.rfind("}")
         return json.loads(txt[start:end+1])
-    except Exception:
-        return {}
+    except Exception as e:
+        return {"_error": f"llm_json failed: {e}"}
 
 def llm_json_structured(system: str, user: str) -> Dict:
     client = get_client()
@@ -172,28 +175,34 @@ def llm_json_structured(system: str, user: str) -> Dict:
             model=OPENAI_MODEL,
             response_format={"type": "json_object"},
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            max_tokens=MAX_TOKENS,
         )
         return json.loads(resp.choices[0].message.content or "{}")
     except Exception:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        )
-        txt = resp.choices[0].message.content or "{}"
         try:
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                max_tokens=MAX_TOKENS,
+            )
+            txt = resp.choices[0].message.content or "{}"
             start = txt.find("{"); end = txt.rfind("}")
             return json.loads(txt[start:end+1])
-        except Exception:
-            return {}
+        except Exception as e:
+            return {"_error": f"llm_json_structured failed: {e}"}
 
 def llm_html_from_json(system: str, json_payload: Dict, transcript_text: str) -> str:
     client = get_client()
-    user_blob = json.dumps({"json": json_payload, "transcript": transcript_text}, ensure_ascii=False)
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user_blob}],
-    )
-    return (resp.choices[0].message.content or "").strip()
+    try:
+        user_blob = json.dumps({"json": json_payload, "transcript": transcript_text}, ensure_ascii=False)
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user_blob}],
+            max_tokens=MAX_TOKENS,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        return f"<p><em>analysis generation failed:</em> {e}</p>"
 
 # ─────────────────── Validation / Repair ───────────────
 def _is_substring_loosely(s: str, blob: str) -> bool:
@@ -237,6 +246,7 @@ def repair_json_with_model(bad_payload: Dict, transcript_blob: str, hints_blob: 
                 {"role":"system","content":"You repair JSON to satisfy validation rules using only transcript/hints."},
                 {"role":"user","content":json.dumps(instruction, ensure_ascii=False)}
             ],
+            max_tokens=MAX_TOKENS,
         )
         return json.loads(resp.choices[0].message.content or "{}")
     except Exception:
@@ -354,82 +364,94 @@ INDEX_HTML = """
 
 # ─────────────────── Builder pipeline ──────────────────
 def build_case_study(url: str, overrides: Optional[Dict[str, str]] = None) -> str:
-    vid = video_id_from_url(url)
-    meta = fetch_basic_metadata(vid)
-    segments = fetch_transcript_segments(vid)
-    timecoded = "\n".join(f"{_format_time(s['start'])}  {s['text']}" for s in segments[:200])
-    transcript_text = " ".join(s["text"] for s in segments)[:20000]
-
-    # Hints from UI (credits, key lines, beats)
-    hints = (overrides or {}).get("_hints", "")
-
-    # Prepare prompt blocks
-    user_block = ANALYSIS_USER_TEMPLATE.render(
-        url=url, title=meta.get("title",""), author=meta.get("author",""),
-        timecoded=timecoded, transcript=transcript_text
-    )
-    json_user_block = user_block + "\n\nHINTS (optional user-provided facts):\n" + hints
-
-    # 1) Naming (cautious) + overrides
-    raw_naming = llm_json(NAMING_SYSTEM, user_block) or {}
-    overrides = overrides or {}
-    raw_naming.update({k:v for k,v in overrides.items() if v and k != "_hints"})
-    naming = Naming(
-        agency=raw_naming.get("agency","Unknown"),
-        product=raw_naming.get("product","Unknown"),
-        campaign=raw_naming.get("campaign","Unknown"),
-        commercial=raw_naming.get("commercial", meta.get("title","Unknown")),
-        director=raw_naming.get("director","Unknown"),
-    )
-
-    # 2) Structured JSON (scenes + script + brand)
-    json_payload = llm_json_structured(STRUCTURED_JSON_SPEC, json_user_block)
-    # Ensure required keys exist
-    json_payload.setdefault("video", {"url": url, "title": meta.get("title",""), "channel": meta.get("author","")})
-    json_payload.setdefault("naming", {
-        "agency": naming.agency, "product": naming.product, "campaign": naming.campaign,
-        "commercial": naming.commercial, "director": naming.director
-    })
-    json_payload.setdefault("scenes", [])
-    json_payload.setdefault("script", [])
-    json_payload.setdefault("brand", {
-        "product": naming.product, "distinctive_assets": [], "claims": [], "ctas": []
-    })
-
-    # 3) Validation + up to 2 repair passes for verbatim accuracy / coverage
-    for _ in range(2):
-        issues = validate_json(json_payload, transcript_text, hints)
-        if not issues:
-            break
-        json_payload = repair_json_with_model(json_payload, transcript_text, hints)
-
-    # 4) Analysis sections strictly from JSON + transcript
-    analysis_html = llm_html_from_json(ANALYSIS_FROM_JSON, json_payload, transcript_text)
-
-    # Save sidecar JSON
-    json_path = os.path.join(OUT_DIR, Naming(**json_payload["naming"]).filename().replace(".pdf", ".json"))
+    html = ""  # for debug write if we fail after building HTML
     try:
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(json_payload, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+        vid = video_id_from_url(url)
+        meta = fetch_basic_metadata(vid)
+        segments = fetch_transcript_segments(vid)
+        timecoded = "\n".join(f"{_format_time(s['start'])}  {s['text']}" for s in segments[:220])
+        transcript_text = " ".join(s["text"] for s in segments)[:22000]
 
-    # 5) Render PDF from JSON (lazy WeasyPrint import)
-    from weasyprint import HTML as WEASY_HTML
+        # Hints from UI (credits, key lines, beats)
+        hints = (overrides or {}).get("_hints", "")
 
-    heading = f"{naming.agency} – {naming.product} – {naming.campaign} – {naming.commercial} – {naming.director}"
-    html = PDF_HTML.render(
-        file_title=naming.filename().replace(".pdf",""),
-        heading=heading,
-        naming=naming,
-        scenes=json_payload["scenes"],
-        script=json_payload["script"],
-        analysis_html=analysis_html,
-        url=url,
-    )
-    pdf_path = os.path.join(OUT_DIR, naming.filename())
-    WEASY_HTML(string=html).write_pdf(pdf_path)
-    return pdf_path
+        # Prepare prompt blocks
+        user_block = ANALYSIS_USER_TEMPLATE.render(
+            url=url, title=meta.get("title",""), author=meta.get("author",""),
+            timecoded=timecoded, transcript=transcript_text
+        )
+        json_user_block = user_block + "\n\nHINTS (optional user-provided facts):\n" + hints
+
+        # 1) Naming (cautious) + overrides
+        raw_naming = llm_json(NAMING_SYSTEM, user_block) or {}
+        overrides = overrides or {}
+        raw_naming.update({k:v for k,v in overrides.items() if v and k != "_hints"})
+        naming = Naming(
+            agency=raw_naming.get("agency","Unknown"),
+            product=raw_naming.get("product","Unknown"),
+            campaign=raw_naming.get("campaign","Unknown"),
+            commercial=raw_naming.get("commercial", meta.get("title","Unknown")),
+            director=raw_naming.get("director","Unknown"),
+        )
+
+        # 2) Structured JSON (scenes + script + brand)
+        json_payload = llm_json_structured(STRUCTURED_JSON_SPEC, json_user_block)
+        # Ensure required keys exist
+        json_payload.setdefault("video", {"url": url, "title": meta.get("title",""), "channel": meta.get("author","")})
+        json_payload.setdefault("naming", {
+            "agency": naming.agency, "product": naming.product, "campaign": naming.campaign,
+            "commercial": naming.commercial, "director": naming.director
+        })
+        json_payload.setdefault("scenes", [])
+        json_payload.setdefault("script", [])
+        json_payload.setdefault("brand", {
+            "product": naming.product, "distinctive_assets": [], "claims": [], "ctas": []
+        })
+
+        # 3) Validation + limited repair passes for verbatim accuracy / coverage
+        for _ in range(REPAIR_PASSES):
+            issues = validate_json(json_payload, transcript_text, hints)
+            if not issues:
+                break
+            json_payload = repair_json_with_model(json_payload, transcript_text, hints)
+
+        # 4) Analysis sections strictly from JSON + transcript
+        analysis_html = llm_html_from_json(ANALYSIS_FROM_JSON, json_payload, transcript_text)
+
+        # Save sidecar JSON
+        json_path = os.path.join(OUT_DIR, Naming(**json_payload["naming"]).filename().replace(".pdf", ".json"))
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(json_payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        # 5) Render PDF from JSON (lazy WeasyPrint import)
+        from weasyprint import HTML as WEASY_HTML
+
+        heading = f"{naming.agency} – {naming.product} – {naming.campaign} – {naming.commercial} – {naming.director}"
+        html = PDF_HTML.render(
+            file_title=naming.filename().replace(".pdf",""),
+            heading=heading,
+            naming=naming,
+            scenes=json_payload["scenes"],
+            script=json_payload["script"],
+            analysis_html=analysis_html,
+            url=url,
+        )
+        pdf_path = os.path.join(OUT_DIR, naming.filename())
+        WEASY_HTML(string=html).write_pdf(pdf_path)
+        return pdf_path
+
+    except Exception as e:
+        # Write debug HTML for post-mortem and raise
+        try:
+            debug_path = os.path.join(OUT_DIR, "error_debug.html")
+            with open(debug_path, "w", encoding="utf-8") as f:
+                f.write(f"<h1>Generation failed</h1><pre>{e}</pre><hr/><h2>HTML at failure</h2>{html}")
+        except Exception:
+            pass
+        raise
 
 # ─────────────────────── Routes ────────────────────────
 @app.get("/health")
@@ -455,10 +477,9 @@ def generate():
         pdf_path = build_case_study(url, overrides=overrides)
         return send_file(pdf_path, as_attachment=True, download_name=os.path.basename(pdf_path))
     except Exception as e:
-        return f"<pre>Error: {e}</pre>", 400
+        return f"<pre>Internal error while generating PDF:\n{e}\n\nCheck Render logs for stack trace. If it persists, try setting OPENAI_MODEL=gpt-4o or lowering MAX_TOKENS.</pre>", 500
 
 if __name__ == "__main__":
     # Local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
-
 
