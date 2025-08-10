@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 import requests
 
 # ───────────────────────── ENV ─────────────────────────
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")   # default to GPT‑5 (you have access)
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")   # default to GPT‑5
 OUT_DIR = os.getenv("OUT_DIR", "out")
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -157,7 +157,6 @@ def llm_json(system: str, user: str) -> Dict:
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        temperature=0.2,
     )
     txt = resp.choices[0].message.content or ""
     try:
@@ -173,15 +172,12 @@ def llm_json_structured(system: str, user: str) -> Dict:
             model=OPENAI_MODEL,
             response_format={"type": "json_object"},
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=0.2,
         )
         return json.loads(resp.choices[0].message.content or "{}")
     except Exception:
-        # Fallback: normal mode + best-effort JSON extraction
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=0.2,
         )
         txt = resp.choices[0].message.content or "{}"
         try:
@@ -196,7 +192,6 @@ def llm_html_from_json(system: str, json_payload: Dict, transcript_text: str) ->
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user_blob}],
-        temperature=0.35,
     )
     return (resp.choices[0].message.content or "").strip()
 
@@ -242,7 +237,6 @@ def repair_json_with_model(bad_payload: Dict, transcript_blob: str, hints_blob: 
                 {"role":"system","content":"You repair JSON to satisfy validation rules using only transcript/hints."},
                 {"role":"user","content":json.dumps(instruction, ensure_ascii=False)}
             ],
-            temperature=0.2
         )
         return json.loads(resp.choices[0].message.content or "{}")
     except Exception:
@@ -338,7 +332,7 @@ INDEX_HTML = """
 <body>
   <div class="card">
     <h2>YouTube → Case Study PDF</h2>
-    <p class="muted">Paste a YouTube URL. Optionally add naming overrides and <strong>Hints</strong> (credits, key lines, beats, supers). We’ll return a PDF and save a JSON sidecar.</p>
+    <p class="muted">Paste a YouTube URL. Optionally add naming overrides and Hints (credits, key lines, beats, supers). We’ll return a PDF and save a JSON sidecar.</p>
     <form method="post" action="/generate">
       <label>YouTube URL</label>
       <input name="url" type="text" placeholder="https://www.youtube.com/watch?v=..." required />
@@ -350,7 +344,7 @@ INDEX_HTML = """
         <div><label>Director (optional)</label><input name="director" type="text" /></div>
       </div>
       <label style="margin-top:12px">Hints / Credits / Key Lines (optional)</label>
-      <textarea name="hints" placeholder="e.g., Agency: Erich & Kallman; Director: Harold Einstein; VO: Will Arnett; Key lines: 'We’re making a big change', 'We’re adding a delicious layer of caramel', 'A few million', 'Are you still selling the regular cups? Yup.'; Beats: crockpot face, spit take, dog howl, table flip, window crash; Super: 'New Reese’s Caramel Big Cup'."></textarea>
+      <textarea name="hints" placeholder=""></textarea>
       <p style="margin-top:14px"><button class="btn" type="submit">Generate PDF</button></p>
     </form>
   </div>
@@ -466,4 +460,5 @@ def generate():
 if __name__ == "__main__":
     # Local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
+
 
