@@ -1,6 +1,6 @@
 import os, re, json
 from urllib.parse import urlparse, parse_qs
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 from flask import Flask, request, render_template_string, send_file
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -9,15 +9,18 @@ from pydantic import BaseModel, Field
 from weasyprint import HTML
 import requests
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
-OUT_DIR = os.getenv("OUT_DIR", "out")
-os.makedirs(OUT_DIR, exist_ok=True)
-
+# ---- OpenAI v1 SDK ----
 from openai import OpenAI
 client = OpenAI()  # reads OPENAI_API_KEY from env
 
+# ---- Env ----
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OUT_DIR = os.getenv("OUT_DIR", "out")
+os.makedirs(OUT_DIR, exist_ok=True)
+
 app = Flask(__name__)
+
+# ----------------- Utilities -----------------
 
 def video_id_from_url(url: str) -> str:
     q = urlparse(url)
@@ -29,11 +32,14 @@ def video_id_from_url(url: str) -> str:
             return vid
     raise ValueError("Could not extract YouTube video id from URL.")
 
+
 def safe_token(s: str) -> str:
     s = (s or "").strip().replace(" ", "_")
     return re.sub(r"[^A-Za-z0-9_\-]", "", s)
 
+
 def fetch_basic_metadata(video_id: str) -> Dict[str, str]:
+    """Lightweight metadata via YouTube oEmbed (no API key)."""
     try:
         r = requests.get(
             "https://www.youtube.com/oembed",
@@ -47,25 +53,36 @@ def fetch_basic_metadata(video_id: str) -> Dict[str, str]:
         pass
     return {"title": "", "author": ""}
 
-def fetch_transcript(video_id: str) -> str:
+
+def _format_time(seconds: float) -> str:
+    m = int(seconds // 60)
+    s = int(round(seconds % 60))
+    return f"{m:02d}:{s:02d}"
+
+
+def fetch_transcript_segments(video_id: str) -> List[Dict]:
+    """Return list of {'start': float, 'text': str}. Empty list on failure."""
     try:
         trs = YouTubeTranscriptApi.list_transcripts(video_id)
         try:
             t = trs.find_transcript(["en", "en-US"]).fetch()
-            return " ".join(seg["text"] for seg in t if seg["text"].strip())
         except Exception:
-            pass
-        t = YouTubeTranscriptApi.get_transcript(video_id)
-        return " ".join(seg["text"] for seg in t if seg["text"].strip())
+            t = YouTubeTranscriptApi.get_transcript(video_id)
+        return [
+            {"start": float(seg.get("start", 0.0)), "text": seg.get("text", "")}
+            for seg in t if seg.get("text", "").strip()
+        ]
     except Exception:
-        return ""
+        return []
 
+# ----------------- Naming model -----------------
 class Naming(BaseModel):
     agency: str = Field("Unknown")
     product: str = Field("Unknown")
     campaign: str = Field("Unknown")
     commercial: str = Field("Unknown")
     director: str = Field("Unknown")
+
     def filename(self) -> str:
         return (
             f"{safe_token(self.agency)}-"
@@ -75,37 +92,137 @@ class Naming(BaseModel):
             f"{safe_token(self.director)}.pdf"
         )
 
+# ----------------- Prompts -----------------
 ANALYSIS_SYSTEM = (
-    "You are a creative ad analyst. Produce a thorough case study of a video campaign.\n"
-    "Structure strictly as:\n"
-    "1. Content Summary and Structure\n"
-    "2. What Makes It Compelling & Unique\n"
-    "3. Creative Strategy Applied\n"
-    "4. Campaign Objectives, Execution & Reach (use a 2-column table)\n"
-    "5. Performance & Audience Impact (include quant data if present; otherwise mark as 'indicative')\n"
-    "6. Why It’s Award‑Worthy\n"
-    "7. Core Insight (The 'Big Idea')\n"
-    "Include one reference link to the provided YouTube URL at the end.\n"
-    "Tone: professional, clear, no emojis."
-)
-
-NAMING_SYSTEM = (
-    "Extract (or reasonably infer) the following fields for naming: Agency, Product, Campaign, Commercial, Director.\n"
-    "Return ONLY compact JSON with keys: agency, product, campaign, commercial, director.\n"
-    "Be conservative with proper nouns. If uncertain, use 'Unknown'."
+    "You are a creative ad analyst. Produce a rigorous, concrete breakdown of a TVC/online video ad.
+"
+    "OUTPUT A (for humans): VALID HTML only (no Markdown). Use semantic tags (<h2>, <ol>, <ul>, <table>, <p>).
+"
+    "Sections (exact titles as <h2>):
+"
+    "1. Scene-by-Scene Description (Timecoded)
+"
+    "   - Use an ordered list. For each beat: [mm:ss], WHAT WE SEE (framing/camera/mise-en-scène), WHAT WE HEAR (dialog/VO/SFX/music), any on-screen text/supers, and the narrative purpose.
+"
+    "2. Annotated Script
+"
+    "   - Provide an HTML <table> with headers: Time | Script (verbatim) | Director’s Notes | Brand/Strategy Note.
+"
+    "   - Director’s Notes: shot type (WS/MS/CU/ECU), movement (lock-off, push-in, handheld), pacing; notable color/light/composition.
+"
+    "   - Brand/Strategy Note: how this beat serves message, product role, or distinctive brand asset.
+"
+    "3. What Makes It Compelling & Unique
+"
+    "4. Creative Strategy Applied
+"
+    "5. Campaign Objectives, Execution & Reach (2-column HTML table)
+"
+    "6. Performance & Audience Impact (real quant if present; otherwise label as 'indicative')
+"
+    "7. Why It’s Award‑Worthy
+"
+    "8. Core Insight (The 'Big Idea')
+"
+    "Rules: Prefer precise, observable details over adjectives. Use [inferred] when you add connective tissue beyond transcript.
+"
+    "Also output a single hyperlink at the end back to the YouTube URL.
+"
 )
 
 ANALYSIS_USER_TEMPLATE = Template(
-    """YouTube URL: {{ url }}\nVideo Title: {{ title }}\nChannel/Author: {{ author }}\n\nTranscript (may be partial):\n{{ transcript }}"""
+    """YouTube URL: {{ url }}
+Video Title: {{ title }}
+Channel/Author: {{ author }}
+
+Timecoded transcript (first lines):
+{{ timecoded }}
+
+Plain transcript (may be partial):
+{{ transcript }}
+
+Instructions:
+- Use the timecoded lines to anchor each beat and script quotes.
+- Quote dialogue/VO verbatim where possible; mark any fabricated bridging lines as [inferred].
+- If on-screen text/supers appear, capture them verbatim and timecode them."""
 )
+
+NAMING_SYSTEM = (
+    "Extract (or reasonably infer) the following fields for naming: Agency, Product, Campaign, Commercial, Director.
+"
+    "Return ONLY compact JSON with keys: agency, product, campaign, commercial, director.
+"
+    "Be conservative with proper nouns. If uncertain, set 'Unknown'."
+)
+
+STRUCTURED_JSON_SPEC = (
+    "Produce ONLY a JSON object with these top-level keys:
+"
+    "{
+"
+    "  \"video\": {\"url\": string, \"title\": string, \"channel\": string},
+"
+    "  \"scenes\": [
+"
+    "    {
+"
+    "      \"start\": \"mm:ss\",
+"
+    "      \"end\": \"mm:ss\" (optional),
+"
+    "      \"visual\": string,
+"
+    "      \"audio\": string,
+"
+    "      \"on_screen_text\": [string],
+"
+    "      \"purpose\": string
+"
+    "    }
+"
+    "  ],
+"
+    "  \"script\": [
+"
+    "    {
+"
+    "      \"time\": \"mm:ss\",
+"
+    "      \"speaker\": string|null,
+"
+    "      \"line\": string,
+"
+    "      \"directors_notes\": string,
+"
+    "      \"strategy_note\": string
+"
+    "    }
+"
+    "  ],
+"
+    "  \"brand\": {
+"
+    "    \"product\": string,
+"
+    "    \"distinctive_assets\": [string],
+"
+    "    \"claims\": [string],
+"
+    "    \"ctas\": [string]
+"
+    "  }
+"
+    "}
+"
+    "Rules: return STRICT JSON (no trailing commas, no comments, no markdown). Use values from transcript; if you must infer, add ' [inferred]' at the end of the value."
+)
+
+# ----------------- LLM helpers -----------------
 
 def llm_json(system: str, user: str) -> Dict:
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.2,
     )
     txt = resp.choices[0].message.content or ""
@@ -115,17 +232,33 @@ def llm_json(system: str, user: str) -> Dict:
     except Exception:
         return {}
 
-def llm_text(system: str, user: str) -> str:
+
+def llm_html(system: str, user: str) -> str:
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.5,
     )
     return (resp.choices[0].message.content or "").strip()
 
+
+def llm_json_structured(system: str, user: str) -> Dict:
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.2,
+    )
+    txt = resp.choices[0].message.content or "{}"
+    try:
+        return json.loads(txt)
+    except Exception:
+        return {}
+
+# ----------------- HTML for PDF Shell -----------------
 PDF_HTML = Template(
     """
 <!doctype html>
@@ -141,25 +274,88 @@ PDF_HTML = Template(
     .meta { color:#555; font-size:10pt; margin-bottom: 16px; }
     table { border-collapse: collapse; width:100%; font-size:10.5pt }
     th, td { border:1px solid #e5e7eb; padding:8px; vertical-align:top }
+    ol { padding-left: 18px; }
+    ul { padding-left: 18px; }
     .ref { margin-top:18px; font-size:10pt; color:#374151 }
+    a { color:#0f62fe; text-decoration: none; }
   </style>
 </head>
 <body>
   <h1>{{ heading }}</h1>
-  <div class=\"meta\">\n    <strong>Agency:</strong> {{ naming.agency }} &nbsp;|&nbsp;
+  <div class=\"meta\">
+    <strong>Agency:</strong> {{ naming.agency }} &nbsp;|&nbsp;
     <strong>Product:</strong> {{ naming.product }} &nbsp;|&nbsp;
     <strong>Campaign:</strong> {{ naming.campaign }} &nbsp;|&nbsp;
     <strong>Commercial:</strong> {{ naming.commercial }} &nbsp;|&nbsp;
     <strong>Director:</strong> {{ naming.director }}
   </div>
   <hr/>
-  {{ body_html }}
+  {{ body_html | safe }}
   <div class=\"ref\"><strong>Reference:</strong> <a href=\"{{ url }}\">{{ url }}</a></div>
 </body>
 </html>
     """
 )
 
+# ----------------- Core build logic -----------------
+
+def build_case_study(url: str, overrides: Optional[Dict[str, str]] = None) -> str:
+    vid = video_id_from_url(url)
+    meta = fetch_basic_metadata(vid)
+
+    segments = fetch_transcript_segments(vid)
+    timecoded = "
+".join(
+        f"{_format_time(s['start'])}  {s['text']}" for s in segments[:120]
+    )
+    transcript = " ".join(s["text"] for s in segments)[:12000]
+
+    user_block = ANALYSIS_USER_TEMPLATE.render(
+        url=url,
+        title=meta.get("title", ""),
+        author=meta.get("author", ""),
+        timecoded=timecoded,
+        transcript=transcript,
+    )
+
+    # 1) Naming (LLM + overrides)
+    raw_naming = llm_json(NAMING_SYSTEM, user_block) or {}
+    overrides = overrides or {}
+    raw_naming.update({k: v for k, v in overrides.items() if v})
+    naming = Naming(
+        agency=raw_naming.get("agency", "Unknown"),
+        product=raw_naming.get("product", "Unknown"),
+        campaign=raw_naming.get("campaign", "Unknown"),
+        commercial=raw_naming.get("commercial", meta.get("title", "Unknown")),
+        director=raw_naming.get("director", "Unknown"),
+    )
+
+    # 2a) Human-friendly HTML body for PDF
+    body_html = llm_html(ANALYSIS_SYSTEM, user_block)
+
+    # 2b) Machine-readable JSON sidecar for downstream agents
+    json_obj = llm_json_structured(STRUCTURED_JSON_SPEC, user_block)
+    json_path = os.path.join(OUT_DIR, naming.filename().replace(".pdf", ".json"))
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(json_obj, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    # 3) HTML → PDF
+    heading = f"{naming.agency} – {naming.product} – {naming.campaign} – {naming.commercial} – {naming.director}"
+    html = PDF_HTML.render(
+        file_title=naming.filename().replace(".pdf", ""),
+        heading=heading,
+        naming=naming,
+        body_html=body_html,
+        url=url,
+    )
+    pdf_path = os.path.join(OUT_DIR, naming.filename())
+    HTML(string=html).write_pdf(pdf_path)
+    return pdf_path
+
+# ----------------- Minimal UI -----------------
 INDEX_HTML = """
 <!doctype html>
 <html>
@@ -181,10 +377,12 @@ INDEX_HTML = """
 <body>
   <div class=\"card\">
     <h2>YouTube → Case Study PDF</h2>
-    <p class=\"muted\">Paste a YouTube URL. Optionally provide naming overrides. We’ll return a PDF in the format <code>Agency-Product-Campaign_Commercial-Director.pdf</code>.</p>
-    <form method=\"post\" action=\"/generate\">\n      <label>YouTube URL</label>
+    <p class=\"muted\">Paste a YouTube URL. Optionally provide naming overrides. You’ll get a PDF with a detailed <strong>scene-by-scene</strong>, an <strong>annotated script</strong>, and a JSON sidecar for training.</p>
+    <form method=\"post\" action=\"/generate\">
+      <label>YouTube URL</label>
       <input name=\"url\" type=\"text\" placeholder=\"https://www.youtube.com/watch?v=...\" required />
-      <div class=\"grid\">\n        <div><label>Agency (optional)</label><input name=\"agency\" type=\"text\" /></div>
+      <div class=\"grid\">
+        <div><label>Agency (optional)</label><input name=\"agency\" type=\"text\" /></div>
         <div><label>Product (optional)</label><input name=\"product\" type=\"text\" /></div>
         <div><label>Campaign (optional)</label><input name=\"campaign\" type=\"text\" /></div>
         <div><label>Commercial (optional)</label><input name=\"commercial\" type=\"text\" /></div>
@@ -197,46 +395,11 @@ INDEX_HTML = """
 </html>
 """
 
-def build_case_study(url: str, overrides: Optional[Dict[str, str]] = None) -> str:
-    vid = video_id_from_url(url)
-    meta = fetch_basic_metadata(vid)
-    transcript = fetch_transcript(vid)
-
-    user_block = ANALYSIS_USER_TEMPLATE.render(
-        url=url,
-        title=meta.get("title", ""),
-        author=meta.get("author", ""),
-        transcript=transcript[:12000],
-    )
-
-    raw_naming = llm_json(NAMING_SYSTEM, user_block) or {}
-    overrides = overrides or {}
-    raw_naming.update({k: v for k, v in overrides.items() if v})
-    naming = Naming(
-        agency=raw_naming.get("agency", "Unknown"),
-        product=raw_naming.get("product", "Unknown"),
-        campaign=raw_naming.get("campaign", "Unknown"),
-        commercial=raw_naming.get("commercial", meta.get("title", "Unknown")),
-        director=raw_naming.get("director", "Unknown"),
-    )
-
-    body = llm_text(ANALYSIS_SYSTEM, user_block)
-
-    heading = f"{naming.agency} – {naming.product} – {naming.campaign} – {naming.commercial} – {naming.director}"
-    html = PDF_HTML.render(
-        file_title=naming.filename().replace(".pdf", ""),
-        heading=heading,
-        naming=naming,
-        body_html=body.replace("\n", "<br/>"),
-        url=url,
-    )
-    pdf_path = os.path.join(OUT_DIR, naming.filename())
-    HTML(string=html).write_pdf(pdf_path)
-    return pdf_path
-
+# ----------------- Routes -----------------
 @app.get("/")
 def index():
     return render_template_string(INDEX_HTML)
+
 
 @app.post("/generate")
 def generate():
@@ -254,5 +417,8 @@ def generate():
     except Exception as e:
         return f"<pre>Error: {e}</pre>", 400
 
+
 if __name__ == "__main__":
     app.run(debug=True)
+
+
