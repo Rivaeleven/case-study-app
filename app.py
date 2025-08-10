@@ -11,7 +11,10 @@ import requests
 
 # ---- OpenAI v1 SDK ----
 from openai import OpenAI
-client = OpenAI()  # reads OPENAI_API_KEY from env
+
+# Lazy client to avoid boot-time failures
+def get_client():
+    return OpenAI()  # reads OPENAI_API_KEY from env
 
 # ---- Env ----
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -220,6 +223,7 @@ STRUCTURED_JSON_SPEC = (
 # ----------------- LLM helpers -----------------
 
 def llm_json(system: str, user: str) -> Dict:
+    client = get_client()
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -227,13 +231,15 @@ def llm_json(system: str, user: str) -> Dict:
     )
     txt = resp.choices[0].message.content or ""
     try:
-        start = txt.find("{"); end = txt.rfind("}")
+        start = txt.find("{")
+        end = txt.rfind("}")
         return json.loads(txt[start:end+1])
     except Exception:
         return {}
 
 
 def llm_html(system: str, user: str) -> str:
+    client = get_client()
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -243,20 +249,30 @@ def llm_html(system: str, user: str) -> str:
 
 
 def llm_json_structured(system: str, user: str) -> Dict:
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.2,
-    )
-    txt = resp.choices[0].message.content or "{}"
+    client = get_client()
+    # Try strict JSON mode first
     try:
-        return json.loads(txt)
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            temperature=0.2,
+        )
+        return json.loads(resp.choices[0].message.content or "{}")
     except Exception:
-        return {}
+        # Fallback: normal completion + best-effort JSON extraction
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            temperature=0.2,
+        )
+        txt = resp.choices[0].message.content or "{}"
+        try:
+            start = txt.find("{")
+            end = txt.rfind("}")
+            return json.loads(txt[start:end+1])
+        except Exception:
+            return {}
 
 # ----------------- HTML for PDF Shell -----------------
 PDF_HTML = Template(
@@ -401,6 +417,11 @@ def index():
     return render_template_string(INDEX_HTML)
 
 
+@app.get("/health")
+def health():
+    return "ok", 200
+
+
 @app.post("/generate")
 def generate():
     url = request.form.get("url", "").strip()
@@ -420,5 +441,3 @@ def generate():
 
 if __name__ == "__main__":
     app.run(debug=True)
-
-
