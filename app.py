@@ -15,11 +15,6 @@ REPAIR_PASSES   = int(os.getenv("REPAIR_PASSES", "2"))     # try to repair twice
 OPENAI_FALLBACK = os.getenv("OPENAI_FALLBACK", "1") == "1" # fallback to gpt-4o once on error
 os.makedirs(OUT_DIR, exist_ok=True)
 
-def _tok() -> Dict[str, int]:
-    """Return token cap compatible with GPT‑5-family models."""
-    max_completion = int(os.getenv("MAX_COMPLETION_TOKENS", "2000"))
-    return {"max_completion_tokens": max_completion}
-
 # ───────────────────── OpenAI (lazy) ───────────────────
 from openai import OpenAI
 def get_client():
@@ -97,32 +92,21 @@ def fetch_transcript_segments(video_id: str) -> List[Dict]:
 JINA = "https://r.jina.ai/http://"
 
 def fetch_youtube_description(video_id: str) -> str:
-    """
-    Try to grab a readable version of the YouTube watch page and extract description-ish text.
-    This is best-effort and may return empty on some videos.
-    """
+    """Best‑effort: readable watch page; often contains description text."""
     try:
         url = f"{JINA}www.youtube.com/watch?v={video_id}"
         r = requests.get(url, timeout=15)
         if r.ok:
-            txt = r.text
-            # crude slice: look for 'Description' section or channel about
-            # Fallback to the whole text which often contains the description near the top
-            return txt[:20000]
+            return r.text[:20000]
     except Exception:
         pass
     return ""
 
 def _extract_credit_fields(text: str) -> Dict[str, str]:
-    """
-    Heuristic regex extraction for Agency / Director / Product / Campaign from plain text.
-    Looks for 'Agency:', 'Director:', 'Client:', 'Brand:', 'Campaign:' patterns.
-    """
+    """Heuristic regex extraction for Agency/Director/Product/Campaign from text."""
     credits = {}
     try:
-        # Normalize whitespace
-        t = re.sub(r"[ \t]+", " ", text)
-        # Common patterns
+        t = re.sub(r"[ \t]+", " ", text or "")
         patterns = {
             "agency": r"(?:Agency|Creative Agency)\s*:\s*([^\n\r;|]+)",
             "director": r"(?:Director)\s*:\s*([^\n\r;|]+)",
@@ -138,16 +122,15 @@ def _extract_credit_fields(text: str) -> Dict[str, str]:
     return credits
 
 def scrape_ispot_by_title(title: str) -> Dict[str, str]:
-    """
-    Try iSpot.tv: search by title, open first result page, extract lines with credits.
-    """
+    """Try iSpot.tv: search by title → first ad page → regex credit extraction."""
     try:
-        q = quote_plus(title)
+        q = quote_plus(title or "")
+        if not q:
+            return {}
         search_url = f"{JINA}www.ispot.tv/search?q={q}"
         rs = requests.get(search_url, timeout=15)
         if not rs.ok:
             return {}
-        # find likely ad link paths '/ad/xxxx/...'
         ad_paths = re.findall(r"/ad/\w+/[a-z0-9\-]+", rs.text, flags=re.IGNORECASE)
         if not ad_paths:
             return {}
@@ -156,9 +139,7 @@ def scrape_ispot_by_title(title: str) -> Dict[str, str]:
         if not rp.ok:
             return {}
         page = rp.text
-        # iSpot often lists credits in a block; try simple regexes
         out = _extract_credit_fields(page)
-        # iSpot sometimes uses "Advertiser:" instead of Brand
         if "product" not in out:
             m = re.search(r"(?:Advertiser)\s*:\s*([^\n\r;|]+)", page, flags=re.IGNORECASE)
             if m: out["product"] = m.group(1).strip()
@@ -167,38 +148,30 @@ def scrape_ispot_by_title(title: str) -> Dict[str, str]:
         return {}
 
 def scrape_shots_by_title(title: str) -> Dict[str, str]:
-    """
-    Try shots.net: search page, then parse snippets for credits-style lines.
-    """
+    """Try shots.net search page for credit-like lines."""
     try:
-        q = quote_plus(title)
+        q = quote_plus(title or "")
+        if not q:
+            return {}
         url = f"{JINA}www.shots.net/search?q={q}"
         r = requests.get(url, timeout=15)
         if not r.ok:
             return {}
-        text = r.text
-        return _extract_credit_fields(text)
+        return _extract_credit_fields(r.text)
     except Exception:
         return {}
 
 def gather_auto_hints(title: str, video_id: str) -> Dict[str, str]:
-    """
-    Best-effort aggregation of credits from YouTube description + iSpot + shots.
-    Later, we format these into a hint string for the model.
-    """
+    """Aggregate credits from YouTube description + iSpot + shots."""
     combined: Dict[str, str] = {}
-
-    # YouTube description (readable proxy)
     desc = fetch_youtube_description(video_id)
     combined.update({k: v for k, v in _extract_credit_fields(desc).items() if v})
 
-    # iSpot (often reliable for TV spots)
     ispot = scrape_ispot_by_title(title or "")
     for k, v in ispot.items():
         if v and k not in combined:
             combined[k] = v
 
-    # shots (craft coverage)
     shots = scrape_shots_by_title(title or "")
     for k, v in shots.items():
         if v and k not in combined:
@@ -207,9 +180,6 @@ def gather_auto_hints(title: str, video_id: str) -> Dict[str, str]:
     return combined
 
 def format_auto_hints(credits: Dict[str, str]) -> str:
-    """
-    Turn scraped credits into a compact hints string.
-    """
     parts = []
     if credits.get("agency"): parts.append(f"Agency: {credits['agency']}")
     if credits.get("director"): parts.append(f"Director: {credits['director']}")
@@ -303,7 +273,6 @@ def llm_json(system: str, user: str) -> Dict:
         resp = _create_with_fallback(
             model=OPENAI_MODEL,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            **_tok(),
         )
         txt = resp.choices[0].message.content or ""
         start = txt.find("{"); end = txt.rfind("}")
@@ -317,7 +286,6 @@ def llm_json_structured(system: str, user: str) -> Dict:
             model=OPENAI_MODEL,
             response_format={"type": "json_object"},
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            **_tok(),
         )
         return json.loads(resp.choices[0].message.content or "{}")
     except Exception:
@@ -325,7 +293,6 @@ def llm_json_structured(system: str, user: str) -> Dict:
             resp = _create_with_fallback(
                 model=OPENAI_MODEL,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                **_tok(),
             )
             txt = resp.choices[0].message.content or "{}"
             start = txt.find("{"); end = txt.rfind("}")
@@ -339,7 +306,6 @@ def llm_html_from_json(system: str, json_payload: Dict, transcript_text: str) ->
         resp = _create_with_fallback(
             model=OPENAI_MODEL,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user_blob}],
-            **_tok(),
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception as e:
@@ -396,7 +362,6 @@ def repair_json_with_model(bad_payload: Dict, transcript_blob: str, hints_blob: 
                 {"role":"system","content":"You repair JSON to satisfy validation rules using only transcript/hints."},
                 {"role":"user","content":json.dumps(instruction, ensure_ascii=False)}
             ],
-            **_tok(),
         )
         return json.loads(resp.choices[0].message.content or "{}")
     except Exception:
@@ -540,21 +505,6 @@ SUCCESS_HTML = """
 """
 
 # ─────────────────── Builder pipeline ──────────────────
-class Naming(BaseModel):
-    agency: str = Field("Unknown")
-    product: str = Field("Unknown")
-    campaign: str = Field("Unknown")
-    commercial: str = Field("Unknown")
-    director: str = Field("Unknown")
-    def filename(self) -> str:
-        return (
-            f"{safe_token(self.agency)}-"
-            f"{safe_token(self.product)}-"
-            f"{safe_token(self.campaign)}_"
-            f"{safe_token(self.commercial)}-"
-            f"{safe_token(self.director)}.pdf"
-        )
-
 def _fill_from_title_if_possible(naming: Naming, title: str) -> Naming:
     """Light heuristic: try to fill product/commercial from oEmbed title if Unknown."""
     if not title:
@@ -599,17 +549,6 @@ def build_case_study(url: str, overrides: Optional[Dict[str, str]] = None) -> Tu
     merged_hints = "; ".join([p for p in [auto_hints, user_hints] if p]).strip()
 
     # Prompt blocks
-    ANALYSIS_USER_TEMPLATE = Template(
-        """YouTube URL: {{ url }}
-Video Title: {{ title }}
-Channel/Author: {{ author }}
-
-Timecoded transcript (first lines):
-{{ timecoded }}
-
-Plain transcript (may be partial):
-{{ transcript }}"""
-    )
     user_block = ANALYSIS_USER_TEMPLATE.render(
         url=url, title=meta.get("title",""), author=meta.get("author",""),
         timecoded=timecoded, transcript=transcript_text
@@ -727,4 +666,5 @@ def generate():
 if __name__ == "__main__":
     # Local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
+
 
