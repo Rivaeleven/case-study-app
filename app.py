@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 import requests
 
 # ───────────────────────── ENV ─────────────────────────
-OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o")   # solid default
+OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o")   # good default for detail
 OUT_DIR         = os.getenv("OUT_DIR", "out")
 REPAIR_PASSES   = int(os.getenv("REPAIR_PASSES", "2"))
 OPENAI_FALLBACK = os.getenv("OPENAI_FALLBACK", "1") == "1"
@@ -23,14 +23,13 @@ SERPAPI_KEY          = os.getenv("SERPAPI_KEY", "")
 # ───────────────────── OpenAI (lazy) ───────────────────
 from openai import OpenAI
 def get_client():
-    return OpenAI()  # reads OPENAI_API_KEY from env
+    return OpenAI()  # reads OPENAI_API_KEY
 
 def _create_with_fallback(**create_kwargs):
     client = get_client()
     try:
         return client.chat.completions.create(**create_kwargs)
     except Exception:
-        # Fallback once to gpt-4o if model is wrong/unavailable
         if OPENAI_FALLBACK:
             try:
                 alt = dict(create_kwargs, model="gpt-4o")
@@ -94,18 +93,18 @@ def fetch_transcript_segments(video_id: str) -> List[Dict]:
 
 # ─────────── Readable fetch, whitelist, search ─────────
 PUBLISHER_WHITELIST = [
-    # ad trades / credits databases
+    # ad trades / credits
     "adage.com", "adweek.com", "campaignlive.com", "campaignlive.co.uk",
-    "shots.net", "lbbonline.com", "thedrum.com", "musebycl.io", "ispot.tv",
-    "shootonline.com", "adforum.com", "adsoftheworld.com",
-    # press wires / brand pressrooms
-    "prnewswire.com", "businesswire.com", "newsroom", "press", "media"
+    "shots.net", "lbbonline.com", "thedrum.com", "musebycl.io",
+    "shootonline.com", "adforum.com", "adsoftheworld.com", "ispot.tv",
+    # brand newsroom / press
+    "thehersheycompany.com", "businesswire.com", "prnewswire.com",
 ]
 
 def is_whitelisted(url: str) -> bool:
     try:
-        host = urlparse(url).hostname or ""
-        return any(d in host for d in PUBLISHER_WHITELIST)
+        host = (urlparse(url).hostname or "").lower()
+        return any(host.endswith(d) or d in host for d in PUBLISHER_WHITELIST)
     except Exception:
         return False
 
@@ -126,7 +125,7 @@ def http_get_readable(url: str, timeout=15):
         pass
     return ""
 
-def web_search(query: str, limit: int = 6) -> List[Dict[str, str]]:
+def web_search(query: str, limit: int = 8) -> List[Dict[str, str]]:
     """Use Bing Web Search if available; else SerpAPI; else empty."""
     results = []
     try:
@@ -151,15 +150,15 @@ def web_search(query: str, limit: int = 6) -> List[Dict[str, str]]:
                     results.append({"title": i.get("title",""), "url": i.get("link","")})
     except Exception:
         pass
-    # De-dup + whitelist preference
-    dedup = []
-    seen = set()
+
+    dedup, seen = [], set()
     for it in results:
         u = it.get("url","")
         if not u or u in seen:
             continue
+        seen.add(u)
         if is_whitelisted(u):
-            dedup.append(it); seen.add(u)
+            dedup.append(it)
     return dedup[:limit]
 
 # ─────────────── YouTube description (yt-dlp) ──────────
@@ -188,24 +187,26 @@ def extract_credit(text: str, pattern: str) -> List[str]:
 
 def enrich_from_trades(title: str, brand_hint: str = "") -> Dict[str, List[str]]:
     """
-    Search ad trades for this spot and extract credits.
+    Search ad trades/brand press with focused queries; extract credits.
     Returns: { 'voiceover': [...], 'director': [...], 'agency': [...], 'sources': [...] }
     """
     if not title and not brand_hint:
         return {}
 
-    queries = []
     base = title or brand_hint
-    queries += [
-        f"{base} voiceover", f"{base} VO", f"{base} narrator",
-        f"{base} director", f"{base} credits", f"{base} ad agency"
+    queries = [
+        f"site:adweek.com {base}",
+        f"site:adage.com {base}",
+        f"site:lbbonline.com {base}",
+        f"site:shots.net {base}",
+        f"site:adforum.com {base}",
+        f"site:adsoftheworld.com {base}",
+        f"site:ispot.tv {base}",
+        f"site:thehersheycompany.com {brand_hint or base}",
+        f"{base} Super Bowl voiceover",
+        f"{base} Super Bowl director",
+        f"{brand_hint} ad agency credits" if brand_hint else base,
     ]
-    if brand_hint:
-        queries += [
-            f"{brand_hint} Super Bowl ad voiceover",
-            f"{brand_hint} Super Bowl ad director",
-            f"{brand_hint} Super Bowl ad credits"
-        ]
 
     seen_urls, pages = set(), []
     for q in queries:
@@ -213,7 +214,7 @@ def enrich_from_trades(title: str, brand_hint: str = "") -> Dict[str, List[str]]
             u = res.get("url", "")
             if not u or u in seen_urls:
                 continue
-            if not any(pub in u for pub in PUBLISHER_WHITELIST):
+            if not is_whitelisted(u):
                 continue
             seen_urls.add(u)
             pages.append((u, http_get_readable(u)))
@@ -231,12 +232,12 @@ def enrich_from_trades(title: str, brand_hint: str = "") -> Dict[str, List[str]]
 
     def pick_best(d: Dict[str, List[str]]) -> Tuple[str, List[str]]:
         if not d: return "Unknown", []
-        best = max(d.items(), key=lambda kv: len(kv[1]))
-        return best[0], best[1]
+        return max(d.items(), key=lambda kv: len(kv[1]))
 
     voice, voice_srcs = pick_best(bag["voiceover"])
     direc, direc_srcs = pick_best(bag["director"])
     agcy,  agcy_srcs  = pick_best(bag["agency"])
+
     return {
         "voiceover": [voice] if voice != "Unknown" else [],
         "director": [direc] if direc != "Unknown" else [],
@@ -244,7 +245,7 @@ def enrich_from_trades(title: str, brand_hint: str = "") -> Dict[str, List[str]]
         "sources": list({*voice_srcs, *direc_srcs, *agcy_srcs})
     }
 
-# ─────────────────────── Prompts ───────────────────────
+# ─────────────────────── Prompts (UPGRADED) ───────────────────────
 NAMING_SYSTEM = """
 Extract (or infer cautiously) the work's naming fields from the provided text.
 We will give you a YouTube URL, title and channel, plus transcript.
@@ -252,27 +253,49 @@ Return ONLY compact JSON with keys: agency, product, campaign, commercial, direc
 If uncertain, use 'Unknown'. Prefer the video title for 'commercial' when unclear.
 """.strip()
 
-STRUCTURED_JSON_SPEC = """
-You will receive the URL, title, channel, and transcript (timecoded preview + plain).
-Return ONLY a STRICT JSON object with keys:
+DETAILED_SCENE_SPEC = """
+You are building a director-level breakdown of a TV commercial from a transcript preview (timecoded snippet) + full plain transcript.
+Your output will be parsed as JSON. Be SPECIFIC and CONCRETE. No generic phrases like "people react"—spell out *what happens* on screen.
+
+Return ONLY this STRICT JSON object:
 
 {
   "video": {"url": string, "title": string, "channel": string},
   "naming": {"agency": string, "product": string, "campaign": string, "commercial": string, "director": string},
   "scenes": [
-    {"start": "mm:ss", "end": "mm:ss" | null, "visual": string, "audio": string, "on_screen_text": [string], "purpose": string}
+    {
+      "start": "mm:ss",
+      "end": "mm:ss" | null,
+      "visual": string,
+      "audio": string,
+      "on_screen_text": [string],
+      "purpose": string
+    }
   ],
   "script": [
-    {"time": "mm:ss", "speaker": string | null, "line": string, "directors_notes": string, "strategy_note": string}
+    {
+      "time": "mm:ss",
+      "speaker": string | null,
+      "line": string,
+      "directors_notes": string,
+      "strategy_note": string
+    }
   ],
-  "brand": {"product": string, "distinctive_assets": [string], "claims": [string], "ctas": [string]}
+  "brand": {
+    "product": string,
+    "distinctive_assets": [string],
+    "claims": [string],
+    "ctas": [string]
+  }
 }
 
-Rules:
-- Anchor times to transcript if present; if not exact, keep conservative and append [inferred].
-- 'line' must be a verbatim substring of the transcript; if not possible, keep short and add ' [inferred]'.
-- Prefer 8–14 scenes and 8–14 script rows for a ~30s ad.
-- Be concise and concrete.
+Rules and tone:
+- Aim for 10–18 scenes in a ~30s spot (merge micro-beats if needed).
+- Anchor times to transcript when possible; if estimating, add " [inferred]" to the field you estimated.
+- "visual" must describe *specific* actions, props, and reactions (e.g., "man dunks his face into a crockpot of chili").
+- "audio" should include VO/SFX/music cues; use short verbatim where possible.
+- "line" MUST be a verbatim substring of the transcript when possible; otherwise keep it brief and append " [inferred]".
+- Use short, tight sentences. No buzzwords.
 """.strip()
 
 ANALYSIS_FROM_JSON = """
@@ -344,7 +367,7 @@ def llm_html_from_json(system: str, json_payload: Dict, transcript_text: str) ->
     except Exception as e:
         return f"<p><em>analysis generation failed:</em> {e}</p>"
 
-# ─────────────────── Validation / Repair ───────────────
+# ─────────────────── Validation / Repair ─────────────
 def _is_substring_loosely(s: str, blob: str) -> bool:
     s_norm = re.sub(r"[^\w\s]", "", (s or "").strip().lower())
     blob_norm = re.sub(r"[^\w\s]", "", (blob or "").strip().lower())
@@ -357,9 +380,9 @@ def validate_json(payload: Dict, transcript_blob: str) -> List[str]:
     errs = []
     scenes = payload.get("scenes") or []
     script = payload.get("script") or []
-    if len(scenes) < 6:
+    if len(scenes) < 8:
         errs.append(f"too_few_scenes:{len(scenes)}")
-    if len(script) < 6:
+    if len(script) < 8:
         errs.append(f"too_few_script_lines:{len(script)}")
     for i, sc in enumerate(scenes):
         if not _looks_like_time(sc.get("start", "")):
@@ -377,9 +400,10 @@ def repair_json_with_model(bad_payload: Dict, transcript_blob: str) -> Dict:
         "task": "repair",
         "issues": validate_json(bad_payload, transcript_blob),
         "rules": [
-            "Ensure 8–14 scenes and 8–14 script lines.",
+            "Ensure 10–18 scenes and 8–16 script lines.",
             "Every 'line' must be a substring of transcript; otherwise append ' [inferred]' and keep it short.",
-            "Preserve timestamps and supers where possible."
+            "Preserve timestamps and supers where possible.",
+            "Make 'visual' descriptions concrete and specific (physical actions, props, reactions)."
         ],
         "transcript": transcript_blob,
         "json": bad_payload,
@@ -389,7 +413,7 @@ def repair_json_with_model(bad_payload: Dict, transcript_blob: str) -> Dict:
             model=OPENAI_MODEL,
             response_format={"type": "json_object"},
             messages=[
-                {"role":"system","content":"You repair JSON to satisfy validation rules using only transcript."},
+                {"role":"system","content":"You repair JSON to satisfy validation rules using only the transcript."},
                 {"role":"user","content":json.dumps(instruction, ensure_ascii=False)}
             ],
         )
@@ -397,7 +421,194 @@ def repair_json_with_model(bad_payload: Dict, transcript_blob: str) -> Dict:
     except Exception:
         return bad_payload
 
+# ─────────────────── Builder pipeline ──────────────────
+class Naming(BaseModel):
+    agency: str = Field("Unknown")
+    product: str = Field("Unknown")
+    campaign: str = Field("Unknown")
+    commercial: str = Field("Unknown")
+    director: str = Field("Unknown")
+    voiceover: str = Field("Unknown")
+    def filename(self) -> str:
+        return (
+            f"{safe_token(self.agency)}-"
+            f"{safe_token(self.product)}-"
+            f"{safe_token(self.campaign)}_"
+            f"{safe_token(self.commercial)}-"
+            f"{safe_token(self.director)}.pdf"
+        )
+
+def _fill_from_title_if_possible(naming: Naming, title: str) -> Naming:
+    if not title:
+        return naming
+    if naming.product == "Unknown" or naming.commercial == "Unknown":
+        if " / " in title:
+            parts = title.split(" / ", 1)
+            if naming.product == "Unknown":
+                naming.product = parts[0].strip() or "Unknown"
+            if naming.commercial == "Unknown":
+                naming.commercial = parts[1].strip() or naming.commercial
+        elif " – " in title:
+            parts = title.split(" – ", 1)
+            if naming.product == "Unknown":
+                naming.product = parts[0].strip() or "Unknown"
+            if naming.commercial == "Unknown":
+                naming.commercial = parts[1].strip() or naming.commercial
+    return naming
+
+def build_case_study(url: str, provided_transcript: Optional[str] = None) -> str:
+    """
+    Build the PDF (with richer, director-level scene detail) and return its file path.
+    """
+    # Extract and fetch metadata
+    vid = video_id_from_url(url)
+    meta = fetch_basic_metadata(vid)
+
+    # Transcript (prefer user-provided)
+    if provided_transcript:
+        transcript_text = provided_transcript[:24000]
+        preview_lines = transcript_text.splitlines()[:24]
+        timecoded = "\n".join(preview_lines)
+    else:
+        segments = fetch_transcript_segments(vid)
+        if not segments:
+            segments = [{"start": 0.0, "text": ""}]
+        timecoded = "\n".join(f"{_format_time(s['start'])}  {s['text']}" for s in segments[:260])
+        transcript_text = " ".join(s["text"] for s in segments)[:24000]
+
+    # LLM user block
+    user_block = ANALYSIS_USER_TEMPLATE.render(
+        url=url, title=meta.get("title",""), author=meta.get("author",""),
+        timecoded=timecoded, transcript=transcript_text
+    )
+
+    # Naming via LLM
+    raw_naming = llm_json(NAMING_SYSTEM, user_block) or {}
+    naming = Naming(
+        agency=raw_naming.get("agency","Unknown"),
+        product=raw_naming.get("product","Unknown"),
+        campaign=raw_naming.get("campaign","Unknown"),
+        commercial=raw_naming.get("commercial", meta.get("title","Unknown")),
+        director=raw_naming.get("director","Unknown"),
+        voiceover="Unknown",
+    )
+    naming = _fill_from_title_if_possible(naming, meta.get("title",""))
+
+    # Enrich with ad-trade research (voiceover/director/agency)
+    brand_hint = naming.product if naming.product != "Unknown" else meta.get("title", "")
+    trade_hits = enrich_from_trades(meta.get("title","") or brand_hint, brand_hint)
+    if trade_hits.get("voiceover"):
+        naming.voiceover = trade_hits["voiceover"][0]
+    if naming.director == "Unknown" and trade_hits.get("director"):
+        naming.director = trade_hits["director"][0]
+    if naming.agency == "Unknown" and trade_hits.get("agency"):
+        naming.agency = trade_hits["agency"][0]
+
+    # Detailed scene/script JSON
+    detailed_payload = llm_json_structured(DETAILED_SCENE_SPEC, user_block)
+    # Ensure required keys exist
+    detailed_payload.setdefault("video", {"url": url, "title": meta.get("title",""), "channel": meta.get("author","")})
+    detailed_payload.setdefault("naming", {
+        "agency": naming.agency, "product": naming.product, "campaign": naming.campaign,
+        "commercial": naming.commercial, "director": naming.director
+    })
+    detailed_payload.setdefault("scenes", [])
+    detailed_payload.setdefault("script", [])
+    detailed_payload.setdefault("brand", {
+        "product": naming.product, "distinctive_assets": [], "claims": [], "ctas": []
+    })
+
+    # Validation & repair to enforce density + verbatim lines
+    for _ in range(REPAIR_PASSES):
+        issues = validate_json(detailed_payload, transcript_text)
+        if not issues:
+            break
+        detailed_payload = repair_json_with_model(detailed_payload, transcript_text)
+
+    # Analysis HTML (strategy sections)
+    analysis_html = llm_html_from_json(ANALYSIS_FROM_JSON, detailed_payload, transcript_text)
+
+    # Render PDF
+    from weasyprint import HTML as WEASY_HTML
+    heading = f"{naming.agency} – {naming.product} – {naming.campaign} – {naming.commercial} – {naming.director}"
+    html = PDF_HTML.render(
+        file_title=naming.filename().replace(".pdf",""),
+        heading=heading,
+        naming=naming,
+        scenes=detailed_payload["scenes"],
+        script=detailed_payload["script"],
+        analysis_html=analysis_html,
+        url=url,
+    )
+    pdf_path = os.path.join(OUT_DIR, naming.filename())
+    WEASY_HTML(string=html, base_url=".").write_pdf(pdf_path)
+    return pdf_path
+
 # ─────────────────── HTML Templates ────────────────────
+INDEX_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>YouTube → Case Study PDF</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color:#111; margin: 24px; }
+    .card { max-width: 860px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 14px; padding: 20px; box-shadow: 0 6px 20px rgba(0,0,0,.05); }
+    label { display:block; margin: 10px 0 6px; font-weight: 600; }
+    input[type=text], textarea { width:100%; padding:10px 12px; border:1px solid #d1d5db; border-radius:10px; font-size:15px; }
+    textarea { min-height: 140px; }
+    .btn { background:#111827; color:#fff; border:none; padding: 10px 14px; border-radius: 10px; cursor:pointer; }
+    .muted { color:#6b7280; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>YouTube → Case Study PDF</h2>
+    <p class="muted">Paste a YouTube URL and (optionally) a transcript. You’ll get a director-level, scene-by-scene PDF with specific visuals, VO/SFX, and purpose per beat.</p>
+    <form method="post" action="/generate">
+      <label>YouTube URL</label>
+      <input name="url" type="text" placeholder="https://www.youtube.com/watch?v=..." required />
+      <label style="margin-top:12px">Transcript (optional)</label>
+      <textarea name="transcript" placeholder="Paste the full transcript here if you have it. If empty, we’ll try to fetch captions automatically."></textarea>
+      <p style="margin-top:14px"><button class="btn" type="submit">Generate PDF</button></p>
+    </form>
+  </div>
+</body>
+</html>
+"""
+
+SUCCESS_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Case Study Ready</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color:#111; margin: 24px; }
+    .card { max-width: 860px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 14px; padding: 20px; box-shadow: 0 6px 20px rgba(0,0,0,.05); text-align: center; }
+    .btn { background:#111827; color:#fff; border:none; padding: 10px 14px; border-radius: 10px; cursor:pointer; text-decoration: none; }
+    .muted { color:#6b7280; font-size: 13px; }
+  </style>
+  <script>
+    window.addEventListener('DOMContentLoaded', () => {
+      const a = document.getElementById('dl');
+      if (a) a.click();
+    });
+  </script>
+</head>
+<body>
+  <div class="card">
+    <h2>Success!</h2>
+    <p>Your case study PDF is ready. It should begin downloading automatically.</p>
+    <p><a id="dl" href="{{ pdf_url }}" class="btn" download>Download PDF: {{ pdf_filename }}</a></p>
+    <p style="margin-top:20px"><a href="/">Generate another</a></p>
+  </div>
+</body>
+</html>
+"""
+
 PDF_HTML = Template("""
 <!doctype html>
 <html>
@@ -468,189 +679,6 @@ PDF_HTML = Template("""
 </html>
 """)
 
-INDEX_HTML = """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>YouTube → Case Study PDF</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color:#111; margin: 24px; }
-    .card { max-width: 860px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 14px; padding: 20px; box-shadow: 0 6px 20px rgba(0,0,0,.05); }
-    label { display:block; margin: 10px 0 6px; font-weight: 600; }
-    input[type=text], textarea { width:100%; padding:10px 12px; border:1px solid #d1d5db; border-radius:10px; font-size:15px; }
-    textarea { min-height: 140px; }
-    .btn { background:#111827; color:#fff; border:none; padding: 10px 14px; border-radius: 10px; cursor:pointer; }
-    .muted { color:#6b7280; font-size: 13px; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h2>YouTube → Case Study PDF</h2>
-    <p class="muted">Paste a YouTube URL and (optionally) the full <strong>Transcript</strong>. We’ll return a PDF.</p>
-    <form method="post" action="/generate">
-      <label>YouTube URL</label>
-      <input name="url" type="text" placeholder="https://www.youtube.com/watch?v=..." required />
-      <label style="margin-top:12px">Transcript (optional — paste if you already have it)</label>
-      <textarea name="transcript" placeholder="Paste full transcript here. If empty, we’ll try to fetch captions automatically."></textarea>
-      <p style="margin-top:14px"><button class="btn" type="submit">Generate PDF</button></p>
-    </form>
-  </div>
-</body>
-</html>
-"""
-
-SUCCESS_HTML = """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>PDF Ready</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color:#111; margin: 24px; text-align:center; }
-    .btn { background:#111827; color:#fff; border:none; padding: 10px 14px; border-radius: 10px; cursor:pointer; text-decoration: none; }
-    .muted { color:#6b7280; font-size: 13px; margin-top: 10px; }
-  </style>
-</head>
-<body>
-  <h2>Your PDF is ready</h2>
-  <p><a id="dl" href="{{ pdf_url }}" class="btn" download>Download PDF: {{ pdf_filename }}</a></p>
-  <p class="muted">The download should start automatically. If not, click the button above.</p>
-  <script>
-    setTimeout(function () {
-      var a = document.getElementById('dl');
-      if (a) { a.click(); }
-    }, 400);
-  </script>
-  <p style="margin-top:20px"><a href="/">Generate another</a></p>
-</body>
-</html>
-"""
-
-# ─────────────────── Builder pipeline ──────────────────
-class Naming(BaseModel):
-    agency: str = Field("Unknown")
-    product: str = Field("Unknown")
-    campaign: str = Field("Unknown")
-    commercial: str = Field("Unknown")
-    director: str = Field("Unknown")
-    voiceover: str = Field("Unknown")
-    def filename(self) -> str:
-        return (
-            f"{safe_token(self.agency)}-"
-            f"{safe_token(self.product)}-"
-            f"{safe_token(self.campaign)}_"
-            f"{safe_token(self.commercial)}-"
-            f"{safe_token(self.director)}.pdf"
-        )
-
-def _fill_from_title_if_possible(naming: Naming, title: str) -> Naming:
-    if not title:
-        return naming
-    if naming.product == "Unknown" or naming.commercial == "Unknown":
-        if " / " in title:
-            parts = title.split(" / ", 1)
-            if naming.product == "Unknown":
-                naming.product = parts[0].strip() or "Unknown"
-            if naming.commercial == "Unknown":
-                naming.commercial = parts[1].strip() or naming.commercial
-        elif " – " in title:
-            parts = title.split(" – ", 1)
-            if naming.product == "Unknown":
-                naming.product = parts[0].strip() or "Unknown"
-            if naming.commercial == "Unknown":
-                naming.commercial = parts[1].strip() or naming.commercial
-    return naming
-
-def build_case_study(url: str, provided_transcript: Optional[str] = None) -> str:
-    """
-    Build the PDF and return its file path.
-    """
-    # Extract and fetch metadata
-    vid = video_id_from_url(url)
-    meta = fetch_basic_metadata(vid)
-
-    # Transcript (prefer user-provided)
-    if provided_transcript:
-        transcript_text = provided_transcript[:22000]
-        preview_lines = transcript_text.splitlines()[:20]
-        timecoded = "\n".join(preview_lines)
-    else:
-        segments = fetch_transcript_segments(vid)
-        if not segments:
-            segments = [{"start": 0.0, "text": ""}]
-        timecoded = "\n".join(f"{_format_time(s['start'])}  {s['text']}" for s in segments[:220])
-        transcript_text = " ".join(s["text"] for s in segments)[:22000]
-
-    # LLM user block
-    user_block = ANALYSIS_USER_TEMPLATE.render(
-        url=url, title=meta.get("title",""), author=meta.get("author",""),
-        timecoded=timecoded, transcript=transcript_text
-    )
-
-    # Naming via LLM
-    raw_naming = llm_json(NAMING_SYSTEM, user_block) or {}
-    naming = Naming(
-        agency=raw_naming.get("agency","Unknown"),
-        product=raw_naming.get("product","Unknown"),
-        campaign=raw_naming.get("campaign","Unknown"),
-        commercial=raw_naming.get("commercial", meta.get("title","Unknown")),
-        director=raw_naming.get("director","Unknown"),
-        voiceover="Unknown",
-    )
-    naming = _fill_from_title_if_possible(naming, meta.get("title",""))
-
-    # Enrich with ad-trade research (voiceover/director/agency)
-    brand_hint = naming.product if naming.product != "Unknown" else meta.get("title", "")
-    trade_hits = enrich_from_trades(meta.get("title","") or brand_hint, brand_hint)
-    if trade_hits.get("voiceover"):
-        naming.voiceover = trade_hits["voiceover"][0]
-    if naming.director == "Unknown" and trade_hits.get("director"):
-        naming.director = trade_hits["director"][0]
-    if naming.agency == "Unknown" and trade_hits.get("agency"):
-        naming.agency = trade_hits["agency"][0]
-
-    # Structured JSON (scenes + script + brand)
-    json_payload = llm_json_structured(STRUCTURED_JSON_SPEC, user_block)
-    json_payload.setdefault("video", {"url": url, "title": meta.get("title",""), "channel": meta.get("author","")})
-    json_payload.setdefault("naming", {
-        "agency": naming.agency, "product": naming.product, "campaign": naming.campaign,
-        "commercial": naming.commercial, "director": naming.director
-    })
-    json_payload.setdefault("scenes", [])
-    json_payload.setdefault("script", [])
-    json_payload.setdefault("brand", {
-        "product": naming.product, "distinctive_assets": [], "claims": [], "ctas": []
-    })
-
-    # Validation & light repair
-    for _ in range(REPAIR_PASSES):
-        issues = validate_json(json_payload, transcript_text)
-        if not issues:
-            break
-        json_payload = repair_json_with_model(json_payload, transcript_text)
-
-    # Analysis strictly from JSON + transcript
-    analysis_html = llm_html_from_json(ANALYSIS_FROM_JSON, json_payload, transcript_text)
-
-    # Render PDF
-    from weasyprint import HTML as WEASY_HTML
-    heading = f"{naming.agency} – {naming.product} – {naming.campaign} – {naming.commercial} – {naming.director}"
-    html = PDF_HTML.render(
-        file_title=naming.filename().replace(".pdf",""),
-        heading=heading,
-        naming=naming,
-        scenes=json_payload["scenes"],
-        script=json_payload["script"],
-        analysis_html=analysis_html,
-        url=url,
-    )
-    pdf_path = os.path.join(OUT_DIR, naming.filename())
-    WEASY_HTML(string=html, base_url=".").write_pdf(pdf_path)
-    return pdf_path
-
 # ─────────────────────── Routes ────────────────────────
 @app.get("/health")
 def health():
@@ -663,7 +691,6 @@ def index():
 @app.get("/out/<path:filename>")
 def get_file(filename):
     try:
-        # Return as attachment so browsers treat it as a download
         return send_from_directory(OUT_DIR, filename, as_attachment=True)
     except Exception:
         abort(404)
