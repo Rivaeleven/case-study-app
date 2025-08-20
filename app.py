@@ -1,57 +1,180 @@
-import os, re, requests, json
-from typing import List, Dict, Tuple
-from fastapi import FastAPI
-from pydantic import BaseModel, Field
+import os, re, json
+from urllib.parse import urlparse, parse_qs
+from typing import Optional, Dict, List, Tuple
+
+from flask import Flask, request, render_template_string, send_from_directory, abort
+from youtube_transcript_api import YouTubeTranscriptApi
 from jinja2 import Template
+from pydantic import BaseModel, Field
+import requests
 
-# ─────────────────────────────
-# Web search & readable content
-# ─────────────────────────────
+# ───────────────────────── ENV ─────────────────────────
+OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o")   # solid default
+OUT_DIR         = os.getenv("OUT_DIR", "out")
+REPAIR_PASSES   = int(os.getenv("REPAIR_PASSES", "2"))
+OPENAI_FALLBACK = os.getenv("OPENAI_FALLBACK", "1") == "1"
+os.makedirs(OUT_DIR, exist_ok=True)
 
+# Optional search keys (either works; Bing preferred if present)
+BING_SEARCH_KEY      = os.getenv("BING_SEARCH_KEY", "")
+BING_SEARCH_ENDPOINT = os.getenv("BING_SEARCH_ENDPOINT", "https://api.bing.microsoft.com/v7.0/search")
+SERPAPI_KEY          = os.getenv("SERPAPI_KEY", "")
+
+# ───────────────────── OpenAI (lazy) ───────────────────
+from openai import OpenAI
+def get_client():
+    return OpenAI()  # reads OPENAI_API_KEY from env
+
+def _create_with_fallback(**create_kwargs):
+    client = get_client()
+    try:
+        return client.chat.completions.create(**create_kwargs)
+    except Exception:
+        # Fallback once to gpt-4o if model is wrong/unavailable
+        if OPENAI_FALLBACK:
+            try:
+                alt = dict(create_kwargs, model="gpt-4o")
+                return client.chat.completions.create(**alt)
+            except Exception:
+                pass
+        raise
+
+# ───────────────────────── APP ─────────────────────────
+app = Flask(__name__)
+
+# ────────────────────── Utilities ──────────────────────
+def video_id_from_url(url: str) -> str:
+    q = urlparse(url)
+    if q.hostname in ("youtu.be",):
+        return q.path.lstrip("/")
+    if q.hostname and "youtube.com" in q.hostname:
+        vid = parse_qs(q.query).get("v", [None])[0]
+        if vid:
+            return vid
+    raise ValueError("Could not extract YouTube video id from URL.")
+
+def safe_token(s: str) -> str:
+    s = (s or "").strip().replace(" ", "_")
+    return re.sub(r"[^A-Za-z0-9_\-]", "", s)
+
+def fetch_basic_metadata(video_id: str) -> Dict[str, str]:
+    try:
+        r = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": f"https://www.youtube.com/watch?v={video_id}", "format": "json"},
+            timeout=15,
+        )
+        if r.ok:
+            j = r.json()
+            return {"title": j.get("title", ""), "author": j.get("author_name", "")}
+    except Exception:
+        pass
+    return {"title": "", "author": ""}
+
+def _format_time(seconds: float) -> str:
+    m = int(seconds // 60)
+    s = int(round(seconds % 60))
+    return f"{m:02d}:{s:02d}"
+
+def fetch_transcript_segments(video_id: str) -> List[Dict]:
+    """Return list of segments with start times and text; empty list if missing."""
+    try:
+        trs = YouTubeTranscriptApi.list_transcripts(video_id)
+        try:
+            t = trs.find_transcript(["en", "en-US"]).fetch()
+        except Exception:
+            t = YouTubeTranscriptApi.get_transcript(video_id)
+        return [
+            {"start": float(seg.get("start", 0.0)), "text": seg.get("text", "")}
+            for seg in t
+            if seg.get("text", "").strip()
+        ]
+    except Exception:
+        return []
+
+# ─────────── Readable fetch, whitelist, search ─────────
 PUBLISHER_WHITELIST = [
+    # ad trades / credits databases
     "adage.com", "adweek.com", "campaignlive.com", "campaignlive.co.uk",
     "shots.net", "lbbonline.com", "thedrum.com", "musebycl.io", "ispot.tv",
     "shootonline.com", "adforum.com", "adsoftheworld.com",
-    "prnewswire.com", "businesswire.com"
+    # press wires / brand pressrooms
+    "prnewswire.com", "businesswire.com", "newsroom", "press", "media"
 ]
 
-def web_search(query: str, limit: int = 5):
-    """Use Bing or SerpAPI depending on which key is set."""
-    if os.getenv("BING_SEARCH_KEY"):
-        key = os.getenv("BING_SEARCH_KEY")
-        url = f"https://api.bing.microsoft.com/v7.0/search?q={query}"
-        resp = requests.get(url, headers={"Ocp-Apim-Subscription-Key": key}, timeout=10)
-        data = resp.json()
-        results = []
-        for w in data.get("webPages", {}).get("value", []):
-            results.append({"title": w["name"], "url": w["url"], "snippet": w["snippet"]})
-        return results[:limit]
-    elif os.getenv("SERPAPI_KEY"):
-        key = os.getenv("SERPAPI_KEY")
-        url = f"https://serpapi.com/search.json?q={query}&engine=google&api_key={key}"
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        results = []
-        for w in data.get("organic_results", []):
-            results.append({"title": w["title"], "url": w["link"], "snippet": w.get("snippet", "")})
-        return results[:limit]
-    return []
-
-def http_get_readable(url: str) -> str:
-    """Proxy through Jina.ai to strip boilerplate and return clean text."""
+def is_whitelisted(url: str) -> bool:
     try:
-        prox = "https://r.jina.ai/" + url
-        r = requests.get(prox, timeout=10)
-        if r.status_code == 200:
+        host = urlparse(url).hostname or ""
+        return any(d in host for d in PUBLISHER_WHITELIST)
+    except Exception:
+        return False
+
+def http_get_readable(url: str, timeout=15):
+    """Try Jina Reader proxy first for clean text, then direct."""
+    try:
+        prox = f"https://r.jina.ai/{url}"
+        r = requests.get(prox, timeout=timeout)
+        if r.ok and len(r.text) > 400:
+            return r.text
+    except Exception:
+        pass
+    try:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"})
+        if r.ok:
             return r.text
     except Exception:
         pass
     return ""
 
-# ─────────────────────────────
-# Credit extraction patterns
-# ─────────────────────────────
+def web_search(query: str, limit: int = 6) -> List[Dict[str, str]]:
+    """Use Bing Web Search if available; else SerpAPI; else empty."""
+    results = []
+    try:
+        if BING_SEARCH_KEY:
+            r = requests.get(
+                BING_SEARCH_ENDPOINT,
+                params={"q": query, "count": limit},
+                headers={"Ocp-Apim-Subscription-Key": BING_SEARCH_KEY},
+                timeout=12
+            )
+            if r.ok:
+                for i in r.json().get("webPages", {}).get("value", []):
+                    results.append({"title": i.get("name",""), "url": i.get("url","")})
+        elif SERPAPI_KEY:
+            r = requests.get(
+                "https://serpapi.com/search.json",
+                params={"engine":"google", "q": query, "num": limit, "api_key": SERPAPI_KEY},
+                timeout=12
+            )
+            if r.ok:
+                for i in r.json().get("organic_results", []):
+                    results.append({"title": i.get("title",""), "url": i.get("link","")})
+    except Exception:
+        pass
+    # De-dup + whitelist preference
+    dedup = []
+    seen = set()
+    for it in results:
+        u = it.get("url","")
+        if not u or u in seen:
+            continue
+        if is_whitelisted(u):
+            dedup.append(it); seen.add(u)
+    return dedup[:limit]
 
+# ─────────────── YouTube description (yt-dlp) ──────────
+def yt_description(video_url: str) -> str:
+    """Use yt-dlp to fetch description reliably (when available)."""
+    try:
+        import yt_dlp
+        ydl_opts = {"quiet": True, "skip_download": True, "extract_flat": True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            return (info.get("description") or "")[:20000]
+    except Exception:
+        return ""
+
+# ───────────── Credits extraction helpers ──────────────
 VOICEOVER_PAT = r"(?:Voice[- ]?over|VO|Narration|Narrator)\s*[:\-]\s*([^\n\r;|,]+)"
 DIRECTOR_PAT  = r"(?:Director|Directed by)\s*[:\-]\s*([^\n\r;|,]+)"
 AGENCY_PAT    = r"(?:Agency|Creative Agency)\s*[:\-]\s*([^\n\r;|,]+)"
@@ -64,7 +187,10 @@ def extract_credit(text: str, pattern: str) -> List[str]:
         return []
 
 def enrich_from_trades(title: str, brand_hint: str = "") -> Dict[str, List[str]]:
-    """Search ad trades for credits (voiceover, director, agency)."""
+    """
+    Search ad trades for this spot and extract credits.
+    Returns: { 'voiceover': [...], 'director': [...], 'agency': [...], 'sources': [...] }
+    """
     if not title and not brand_hint:
         return {}
 
@@ -81,15 +207,15 @@ def enrich_from_trades(title: str, brand_hint: str = "") -> Dict[str, List[str]]
             f"{brand_hint} Super Bowl ad credits"
         ]
 
-    seen, pages = set(), []
+    seen_urls, pages = set(), []
     for q in queries:
         for res in web_search(q, limit=6):
             u = res.get("url", "")
-            if not u or u in seen:
+            if not u or u in seen_urls:
                 continue
             if not any(pub in u for pub in PUBLISHER_WHITELIST):
                 continue
-            seen.add(u)
+            seen_urls.add(u)
             pages.append((u, http_get_readable(u)))
 
     bag = {"voiceover": {}, "director": {}, "agency": {}}
@@ -104,28 +230,306 @@ def enrich_from_trades(title: str, brand_hint: str = "") -> Dict[str, List[str]]
             bag["agency"].setdefault(who, []).append(url)
 
     def pick_best(d: Dict[str, List[str]]) -> Tuple[str, List[str]]:
-        if not d:
-            return "Unknown", []
+        if not d: return "Unknown", []
         best = max(d.items(), key=lambda kv: len(kv[1]))
         return best[0], best[1]
 
     voice, voice_srcs = pick_best(bag["voiceover"])
     direc, direc_srcs = pick_best(bag["director"])
-    agcy, agcy_srcs = pick_best(bag["agency"])
+    agcy,  agcy_srcs  = pick_best(bag["agency"])
     return {
         "voiceover": [voice] if voice != "Unknown" else [],
         "director": [direc] if direc != "Unknown" else [],
-        "agency": [agcy] if agcy != "Unknown" else [],
+        "agency":  [agcy]  if agcy  != "Unknown" else [],
         "sources": list({*voice_srcs, *direc_srcs, *agcy_srcs})
     }
 
-# ─────────────────────────────
-# Data models
-# ─────────────────────────────
+# ─────────────────────── Prompts ───────────────────────
+NAMING_SYSTEM = """
+Extract (or infer cautiously) the work's naming fields from the provided text.
+We will give you a YouTube URL, title and channel, plus transcript.
+Return ONLY compact JSON with keys: agency, product, campaign, commercial, director.
+If uncertain, use 'Unknown'. Prefer the video title for 'commercial' when unclear.
+""".strip()
 
-def safe_token(x: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9\-]+", "_", x.strip())
+STRUCTURED_JSON_SPEC = """
+You will receive the URL, title, channel, and transcript (timecoded preview + plain).
+Return ONLY a STRICT JSON object with keys:
 
+{
+  "video": {"url": string, "title": string, "channel": string},
+  "naming": {"agency": string, "product": string, "campaign": string, "commercial": string, "director": string},
+  "scenes": [
+    {"start": "mm:ss", "end": "mm:ss" | null, "visual": string, "audio": string, "on_screen_text": [string], "purpose": string}
+  ],
+  "script": [
+    {"time": "mm:ss", "speaker": string | null, "line": string, "directors_notes": string, "strategy_note": string}
+  ],
+  "brand": {"product": string, "distinctive_assets": [string], "claims": [string], "ctas": [string]}
+}
+
+Rules:
+- Anchor times to transcript if present; if not exact, keep conservative and append [inferred].
+- 'line' must be a verbatim substring of the transcript; if not possible, keep short and add ' [inferred]'.
+- Prefer 8–14 scenes and 8–14 script rows for a ~30s ad.
+- Be concise and concrete.
+""".strip()
+
+ANALYSIS_FROM_JSON = """
+You will receive a JSON (scenes + script) and the transcript text.
+Write VALID HTML for these sections ONLY, using facts from JSON/transcript:
+<h2>What Makes It Compelling & Unique</h2>
+<h2>Creative Strategy Applied</h2>
+<h2>Campaign Objectives, Execution & Reach</h2>
+<h2>Performance & Audience Impact</h2>
+<h2>Why It’s Award-Worthy</h2>
+<h2>Core Insight (The 'Big Idea')</h2>
+Mark any deduction as [inferred]. Keep it tight and specific.
+""".strip()
+
+ANALYSIS_USER_TEMPLATE = Template(
+    """YouTube URL: {{ url }}
+Video Title: {{ title }}
+Channel/Author: {{ author }}
+
+Timecoded transcript (first lines):
+{{ timecoded }}
+
+Plain transcript (may be partial):
+{{ transcript }}"""
+)
+
+# ─────────────────── LLM Helpers ─────────────────────
+def llm_json(system: str, user: str) -> Dict:
+    try:
+        resp = _create_with_fallback(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        )
+        txt = resp.choices[0].message.content or ""
+        start = txt.find("{"); end = txt.rfind("}")
+        return json.loads(txt[start:end+1])
+    except Exception:
+        return {"agency":"Unknown","product":"Unknown","campaign":"Unknown","commercial":"Unknown","director":"Unknown"}
+
+def llm_json_structured(system: str, user: str) -> Dict:
+    try:
+        resp = _create_with_fallback(
+            model=OPENAI_MODEL,
+            response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        )
+        return json.loads(resp.choices[0].message.content or "{}")
+    except Exception:
+        # permissive fallback parse
+        try:
+            resp = _create_with_fallback(
+                model=OPENAI_MODEL,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            )
+            txt = resp.choices[0].message.content or "{}"
+            start = txt.find("{"); end = txt.rfind("}")
+            return json.loads(txt[start:end+1])
+        except Exception:
+            return {}
+
+def llm_html_from_json(system: str, json_payload: Dict, transcript_text: str) -> str:
+    try:
+        user_blob = json.dumps({"json": json_payload, "transcript": transcript_text}, ensure_ascii=False)
+        resp = _create_with_fallback(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user_blob}],
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        return f"<p><em>analysis generation failed:</em> {e}</p>"
+
+# ─────────────────── Validation / Repair ───────────────
+def _is_substring_loosely(s: str, blob: str) -> bool:
+    s_norm = re.sub(r"[^\w\s]", "", (s or "").strip().lower())
+    blob_norm = re.sub(r"[^\w\s]", "", (blob or "").strip().lower())
+    return s_norm and (s_norm in blob_norm)
+
+def _looks_like_time(ts: str) -> bool:
+    return bool(re.match(r"^\d{2}:\d{2}$", (ts or "").strip()))
+
+def validate_json(payload: Dict, transcript_blob: str) -> List[str]:
+    errs = []
+    scenes = payload.get("scenes") or []
+    script = payload.get("script") or []
+    if len(scenes) < 6:
+        errs.append(f"too_few_scenes:{len(scenes)}")
+    if len(script) < 6:
+        errs.append(f"too_few_script_lines:{len(script)}")
+    for i, sc in enumerate(scenes):
+        if not _looks_like_time(sc.get("start", "")):
+            errs.append(f"bad_scene_time_at_{i}")
+    for i, row in enumerate(script):
+        if not _looks_like_time(row.get("time", "")):
+            errs.append(f"bad_script_time_at_{i}")
+        line = (row or {}).get("line", "")
+        if line and not _is_substring_loosely(line, transcript_blob):
+            errs.append(f"non_verbatim_script_line_at_{i}")
+    return errs
+
+def repair_json_with_model(bad_payload: Dict, transcript_blob: str) -> Dict:
+    instruction = {
+        "task": "repair",
+        "issues": validate_json(bad_payload, transcript_blob),
+        "rules": [
+            "Ensure 8–14 scenes and 8–14 script lines.",
+            "Every 'line' must be a substring of transcript; otherwise append ' [inferred]' and keep it short.",
+            "Preserve timestamps and supers where possible."
+        ],
+        "transcript": transcript_blob,
+        "json": bad_payload,
+    }
+    try:
+        resp = _create_with_fallback(
+            model=OPENAI_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role":"system","content":"You repair JSON to satisfy validation rules using only transcript."},
+                {"role":"user","content":json.dumps(instruction, ensure_ascii=False)}
+            ],
+        )
+        return json.loads(resp.choices[0].message.content or "{}")
+    except Exception:
+        return bad_payload
+
+# ─────────────────── HTML Templates ────────────────────
+PDF_HTML = Template("""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>{{ file_title }}</title>
+  <style>
+    body { font: 12pt/1.55 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color:#111; margin: 28px; }
+    h1 { font-size: 20pt; margin: 0 0 8px; }
+    h2 { font-size: 14pt; margin: 22px 0 10px; }
+    hr { border: none; border-top: 1px solid #e5e7eb; margin: 14px 0; }
+    .meta { color:#555; font-size:10pt; margin-bottom: 16px; }
+    table { border-collapse: collapse; width:100%; font-size:10.5pt }
+    th, td { border:1px solid #e5e7eb; padding:8px; vertical-align:top }
+    .ref { margin-top:18px; font-size:10pt; color:#374151 }
+    ol { padding-left: 18px; }
+    a { color: #1f2937; text-decoration: none; border-bottom: 1px dotted #9ca3af; }
+  </style>
+</head>
+<body>
+  <h1>{{ heading }}</h1>
+  <div class="meta">
+    <strong>Agency:</strong> {{ naming.agency }} &nbsp;|&nbsp;
+    <strong>Product:</strong> {{ naming.product }} &nbsp;|&nbsp;
+    <strong>Campaign:</strong> {{ naming.campaign }} &nbsp;|&nbsp;
+    <strong>Commercial:</strong> {{ naming.commercial }} &nbsp;|&nbsp;
+    <strong>Director:</strong> {{ naming.director }} &nbsp;|&nbsp;
+    <strong>Voiceover:</strong> {{ naming.voiceover }}
+  </div>
+  <hr/>
+
+  <h2>Scene-by-Scene Description (Timecoded)</h2>
+  <ol>
+    {% for sc in scenes %}
+      <li>
+        <strong>[{{ sc.start }}{% if sc.end %}–{{ sc.end }}{% endif %}]</strong>
+        <div><em>What we see:</em> {{ sc.visual }}</div>
+        <div><em>What we hear:</em> {{ sc.audio }}</div>
+        {% if sc.on_screen_text and sc.on_screen_text|length %}
+          <div><em>On-screen text:</em> {{ ", ".join(sc.on_screen_text) }}</div>
+        {% endif %}
+        <div><em>Purpose:</em> {{ sc.purpose }}</div>
+      </li>
+    {% endfor %}
+  </ol>
+
+  <h2>Annotated Script</h2>
+  <table>
+    <thead>
+      <tr><th>Time</th><th>Script (verbatim)</th><th>Director’s Notes</th><th>Brand/Strategy Note</th></tr>
+    </thead>
+    <tbody>
+      {% for line in script %}
+      <tr>
+        <td>{{ line.time }}</td>
+        <td>{{ line.line }}</td>
+        <td>{{ line.directors_notes }}</td>
+        <td>{{ line.strategy_note }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {{ analysis_html | safe }}
+
+  <div class="ref"><strong>Reference:</strong> <a href="{{ url }}">{{ url }}</a></div>
+</body>
+</html>
+""")
+
+INDEX_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>YouTube → Case Study PDF</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color:#111; margin: 24px; }
+    .card { max-width: 860px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 14px; padding: 20px; box-shadow: 0 6px 20px rgba(0,0,0,.05); }
+    label { display:block; margin: 10px 0 6px; font-weight: 600; }
+    input[type=text], textarea { width:100%; padding:10px 12px; border:1px solid #d1d5db; border-radius:10px; font-size:15px; }
+    textarea { min-height: 140px; }
+    .btn { background:#111827; color:#fff; border:none; padding: 10px 14px; border-radius: 10px; cursor:pointer; }
+    .muted { color:#6b7280; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>YouTube → Case Study PDF</h2>
+    <p class="muted">Paste a YouTube URL and (optionally) the full <strong>Transcript</strong>. We’ll return a PDF.</p>
+    <form method="post" action="/generate">
+      <label>YouTube URL</label>
+      <input name="url" type="text" placeholder="https://www.youtube.com/watch?v=..." required />
+      <label style="margin-top:12px">Transcript (optional — paste if you already have it)</label>
+      <textarea name="transcript" placeholder="Paste full transcript here. If empty, we’ll try to fetch captions automatically."></textarea>
+      <p style="margin-top:14px"><button class="btn" type="submit">Generate PDF</button></p>
+    </form>
+  </div>
+</body>
+</html>
+"""
+
+SUCCESS_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PDF Ready</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color:#111; margin: 24px; text-align:center; }
+    .btn { background:#111827; color:#fff; border:none; padding: 10px 14px; border-radius: 10px; cursor:pointer; text-decoration: none; }
+    .muted { color:#6b7280; font-size: 13px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h2>Your PDF is ready</h2>
+  <p><a id="dl" href="{{ pdf_url }}" class="btn" download>Download PDF: {{ pdf_filename }}</a></p>
+  <p class="muted">The download should start automatically. If not, click the button above.</p>
+  <script>
+    setTimeout(function () {
+      var a = document.getElementById('dl');
+      if (a) { a.click(); }
+    }, 400);
+  </script>
+  <p style="margin-top:20px"><a href="/">Generate another</a></p>
+</body>
+</html>
+"""
+
+# ─────────────────── Builder pipeline ──────────────────
 class Naming(BaseModel):
     agency: str = Field("Unknown")
     product: str = Field("Unknown")
@@ -142,74 +546,147 @@ class Naming(BaseModel):
             f"{safe_token(self.director)}.pdf"
         )
 
-# ─────────────────────────────
-# HTML template for PDF
-# ─────────────────────────────
+def _fill_from_title_if_possible(naming: Naming, title: str) -> Naming:
+    if not title:
+        return naming
+    if naming.product == "Unknown" or naming.commercial == "Unknown":
+        if " / " in title:
+            parts = title.split(" / ", 1)
+            if naming.product == "Unknown":
+                naming.product = parts[0].strip() or "Unknown"
+            if naming.commercial == "Unknown":
+                naming.commercial = parts[1].strip() or naming.commercial
+        elif " – " in title:
+            parts = title.split(" – ", 1)
+            if naming.product == "Unknown":
+                naming.product = parts[0].strip() or "Unknown"
+            if naming.commercial == "Unknown":
+                naming.commercial = parts[1].strip() or naming.commercial
+    return naming
 
-PDF_HTML = Template("""
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>{{ naming.commercial }}</title>
-  <style>
-    body { font-family: Helvetica, sans-serif; margin: 2em; }
-    h1 { color: #111; }
-    h2 { color: #333; margin-top: 1.4em; }
-    .meta { margin-bottom: 1em; font-size: 0.9em; color: #555; }
-  </style>
-</head>
-<body>
-  <h1>{{ naming.product }} – {{ naming.commercial }}</h1>
-  <div class="meta">
-    <strong>Agency:</strong> {{ naming.agency }} &nbsp;|&nbsp;
-    <strong>Director:</strong> {{ naming.director }} &nbsp;|&nbsp;
-    <strong>Voiceover:</strong> {{ naming.voiceover }}<br>
-    <strong>Campaign:</strong> {{ naming.campaign }}
-  </div>
+def build_case_study(url: str, provided_transcript: Optional[str] = None) -> str:
+    """
+    Build the PDF and return its file path.
+    """
+    # Extract and fetch metadata
+    vid = video_id_from_url(url)
+    meta = fetch_basic_metadata(vid)
 
-  <h2>Scene-by-Scene Breakdown</h2>
-  <pre>{{ scenes }}</pre>
+    # Transcript (prefer user-provided)
+    if provided_transcript:
+        transcript_text = provided_transcript[:22000]
+        preview_lines = transcript_text.splitlines()[:20]
+        timecoded = "\n".join(preview_lines)
+    else:
+        segments = fetch_transcript_segments(vid)
+        if not segments:
+            segments = [{"start": 0.0, "text": ""}]
+        timecoded = "\n".join(f"{_format_time(s['start'])}  {s['text']}" for s in segments[:220])
+        transcript_text = " ".join(s["text"] for s in segments)[:22000]
 
-  <h2>Annotated Script</h2>
-  <pre>{{ script }}</pre>
-</body>
-</html>
-""")
+    # LLM user block
+    user_block = ANALYSIS_USER_TEMPLATE.render(
+        url=url, title=meta.get("title",""), author=meta.get("author",""),
+        timecoded=timecoded, transcript=transcript_text
+    )
 
-# ─────────────────────────────
-# Main app
-# ─────────────────────────────
+    # Naming via LLM
+    raw_naming = llm_json(NAMING_SYSTEM, user_block) or {}
+    naming = Naming(
+        agency=raw_naming.get("agency","Unknown"),
+        product=raw_naming.get("product","Unknown"),
+        campaign=raw_naming.get("campaign","Unknown"),
+        commercial=raw_naming.get("commercial", meta.get("title","Unknown")),
+        director=raw_naming.get("director","Unknown"),
+        voiceover="Unknown",
+    )
+    naming = _fill_from_title_if_possible(naming, meta.get("title",""))
 
-app = FastAPI()
+    # Enrich with ad-trade research (voiceover/director/agency)
+    brand_hint = naming.product if naming.product != "Unknown" else meta.get("title", "")
+    trade_hits = enrich_from_trades(meta.get("title","") or brand_hint, brand_hint)
+    if trade_hits.get("voiceover"):
+        naming.voiceover = trade_hits["voiceover"][0]
+    if naming.director == "Unknown" and trade_hits.get("director"):
+        naming.director = trade_hits["director"][0]
+    if naming.agency == "Unknown" and trade_hits.get("agency"):
+        naming.agency = trade_hits["agency"][0]
+
+    # Structured JSON (scenes + script + brand)
+    json_payload = llm_json_structured(STRUCTURED_JSON_SPEC, user_block)
+    json_payload.setdefault("video", {"url": url, "title": meta.get("title",""), "channel": meta.get("author","")})
+    json_payload.setdefault("naming", {
+        "agency": naming.agency, "product": naming.product, "campaign": naming.campaign,
+        "commercial": naming.commercial, "director": naming.director
+    })
+    json_payload.setdefault("scenes", [])
+    json_payload.setdefault("script", [])
+    json_payload.setdefault("brand", {
+        "product": naming.product, "distinctive_assets": [], "claims": [], "ctas": []
+    })
+
+    # Validation & light repair
+    for _ in range(REPAIR_PASSES):
+        issues = validate_json(json_payload, transcript_text)
+        if not issues:
+            break
+        json_payload = repair_json_with_model(json_payload, transcript_text)
+
+    # Analysis strictly from JSON + transcript
+    analysis_html = llm_html_from_json(ANALYSIS_FROM_JSON, json_payload, transcript_text)
+
+    # Render PDF
+    from weasyprint import HTML as WEASY_HTML
+    heading = f"{naming.agency} – {naming.product} – {naming.campaign} – {naming.commercial} – {naming.director}"
+    html = PDF_HTML.render(
+        file_title=naming.filename().replace(".pdf",""),
+        heading=heading,
+        naming=naming,
+        scenes=json_payload["scenes"],
+        script=json_payload["script"],
+        analysis_html=analysis_html,
+        url=url,
+    )
+    pdf_path = os.path.join(OUT_DIR, naming.filename())
+    WEASY_HTML(string=html, base_url=".").write_pdf(pdf_path)
+    return pdf_path
+
+# ─────────────────────── Routes ────────────────────────
+@app.get("/health")
+def health():
+    return "ok", 200
 
 @app.get("/")
-def home():
-    return {"status": "ok"}
+def index():
+    return render_template_string(INDEX_HTML)
 
-@app.get("/analyze/{video_id}")
-def analyze(video_id: str):
-    """
-    Main entry: fetch metadata + transcript + enrich with ad trades.
-    """
-    # Mock metadata fetch (replace with YouTube API if you want)
-    meta = {"title": "Unknown", "channel": "Unknown"}
-    naming = Naming()
+@app.get("/out/<path:filename>")
+def get_file(filename):
+    try:
+        # Return as attachment so browsers treat it as a download
+        return send_from_directory(OUT_DIR, filename, as_attachment=True)
+    except Exception:
+        abort(404)
 
-    # Enrich with ad trades
-    brand_hint = naming.product if naming.product != "Unknown" else meta.get("title", "")
-    hits = enrich_from_trades(meta.get("title", ""), brand_hint)
-    if hits.get("voiceover"):
-        naming.voiceover = hits["voiceover"][0]
-    if naming.director == "Unknown" and hits.get("director"):
-        naming.director = hits["director"][0]
-    if naming.agency == "Unknown" and hits.get("agency"):
-        naming.agency = hits["agency"][0]
+@app.post("/generate")
+def generate():
+    url = request.form.get("url", "").strip()
+    transcript_text = (request.form.get("transcript") or "").strip()
+    try:
+        pdf_path = build_case_study(url, provided_transcript=(transcript_text or None))
+        pdf_filename = os.path.basename(pdf_path)
+        return render_template_string(
+            SUCCESS_HTML,
+            pdf_url=f"/out/{pdf_filename}",
+            pdf_filename=pdf_filename,
+        )
+    except Exception as e:
+        try:
+            with open(os.path.join(OUT_DIR, "last_error.txt"), "w", encoding="utf-8") as f:
+                f.write(str(e))
+        except Exception:
+            pass
+        return f"<pre>Error generating case study:\n{e}\nCheck Logs and /out/last_error.txt for details.</pre>", 400
 
-    # Fake transcript for now
-    transcript = "[Transcript goes here]"
-    scenes = "[Scene breakdown goes here]"
-    script = "[Annotated script goes here]"
-
-    html = PDF_HTML.render(naming=naming, scenes=scenes, script=script)
-    return {"naming": naming.dict(), "html": html, "sources": hits.get("sources", [])}
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
