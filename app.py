@@ -9,24 +9,27 @@ from pydantic import BaseModel, Field
 import requests
 
 # ───────────────────────── ENV ─────────────────────────
-OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-5")  # default to GPT‑5
+OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o")  # use a real default
 OUT_DIR         = os.getenv("OUT_DIR", "out")
-REPAIR_PASSES   = int(os.getenv("REPAIR_PASSES", "2"))     # try to repair twice
-OPENAI_FALLBACK = os.getenv("OPENAI_FALLBACK", "1") == "1" # fallback to gpt-4o once on error
+REPAIR_PASSES   = int(os.getenv("REPAIR_PASSES", "2"))
+OPENAI_FALLBACK = os.getenv("OPENAI_FALLBACK", "1") == "1"
 os.makedirs(OUT_DIR, exist_ok=True)
+
+# Optional search keys (either works; Bing preferred if present)
+BING_SEARCH_KEY      = os.getenv("BING_SEARCH_KEY", "")
+BING_SEARCH_ENDPOINT = os.getenv("BING_SEARCH_ENDPOINT", "https://api.bing.microsoft.com/v7.0/search")
+SERPAPI_KEY          = os.getenv("SERPAPI_KEY", "")
 
 # ───────────────────── OpenAI (lazy) ───────────────────
 from openai import OpenAI
 def get_client():
-    # Lazy init so the app boots even if the key is missing; errors occur at call time instead.
     return OpenAI()  # reads OPENAI_API_KEY from env
 
 def _create_with_fallback(**create_kwargs):
-    """Call OpenAI; if GPT‑5 errors out and fallback is enabled, retry once on gpt-4o."""
     client = get_client()
     try:
         return client.chat.completions.create(**create_kwargs)
-    except Exception as e:
+    except Exception:
         if OPENAI_FALLBACK and "gpt-5" in create_kwargs.get("model", ""):
             try:
                 alt = dict(create_kwargs, model="gpt-4o")
@@ -88,7 +91,87 @@ def fetch_transcript_segments(video_id: str) -> List[Dict]:
     except Exception:
         return []
 
-# ───────────── Simple external credit scraping ─────────
+# ─────────── Readable fetch, whitelist, search ─────────
+PUBLISHER_WHITELIST = [
+    "adage.com", "adweek.com", "campaignlive.co.uk", "campaignlive.com",
+    "shots.net", "lbbonline.com", "thedrum.com", "musebycl.io", "ispot.tv",
+    "prnewswire.com", "businesswire.com"
+]
+
+def is_whitelisted(url: str) -> bool:
+    try:
+        host = urlparse(url).hostname or ""
+        return any(d in host for d in PUBLISHER_WHITELIST)
+    except Exception:
+        return False
+
+def http_get_readable(url: str, timeout=15):
+    """Try Jina reader proxy first for clean text, then direct."""
+    try:
+        u = urlparse(url)
+        proxy = f"https://r.jina.ai/http://{u.netloc}{u.path}"
+        r = requests.get(proxy, timeout=timeout)
+        if r.ok and len(r.text) > 500:
+            return r.text
+    except Exception:
+        pass
+    try:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"})
+        if r.ok:
+            return r.text
+    except Exception:
+        pass
+    return ""
+
+def web_search(query: str, limit: int = 6) -> List[Dict[str, str]]:
+    """Use Bing Web Search if available; else SerpAPI; else empty."""
+    results = []
+    try:
+        if BING_SEARCH_KEY:
+            r = requests.get(
+                BING_SEARCH_ENDPOINT,
+                params={"q": query, "count": limit},
+                headers={"Ocp-Apim-Subscription-Key": BING_SEARCH_KEY},
+                timeout=12
+            )
+            if r.ok:
+                for i in r.json().get("webPages", {}).get("value", []):
+                    results.append({"title": i.get("name",""), "url": i.get("url","")})
+        elif SERPAPI_KEY:
+            r = requests.get(
+                "https://serpapi.com/search.json",
+                params={"engine":"google", "q": query, "num": limit, "api_key": SERPAPI_KEY},
+                timeout=12
+            )
+            if r.ok:
+                for i in r.json().get("organic_results", []):
+                    results.append({"title": i.get("title",""), "url": i.get("link","")})
+    except Exception:
+        pass
+    # De-dup + whitelist preference
+    dedup = []
+    seen = set()
+    for it in results:
+        u = it.get("url","")
+        if not u or u in seen:
+            continue
+        if is_whitelisted(u):
+            dedup.append(it); seen.add(u)
+    return dedup[:limit]
+
+# ─────────────── YouTube description (yt-dlp) ──────────
+def yt_description(video_url: str) -> str:
+    """Use yt-dlp to fetch description reliably (when available)."""
+    try:
+        import yt_dlp
+        ydl_opts = {"quiet": True, "skip_download": True, "extract_flat": True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            return (info.get("description") or "")[:20000]
+    except Exception:
+        return ""
+
+# ───────────── Simple credit extraction helpers ────────
 JINA = "https://r.jina.ai/http://"
 
 def fetch_youtube_description(video_id: str) -> str:
@@ -121,87 +204,62 @@ def _extract_credit_fields(text: str) -> Dict[str, str]:
         pass
     return credits
 
-def scrape_ispot_by_title(title: str) -> Dict[str, str]:
-    """Try iSpot.tv: search by title → first ad page → regex credit extraction."""
+def scrape_ispot_by_title(title: str) -> Tuple[str, str]:
+    """Try iSpot.tv: return (ad_page_url, page_text) for first likely ad."""
     try:
         q = quote_plus(title or "")
         if not q:
-            return {}
-        search_url = f"{JINA}www.ispot.tv/search?q={q}"
-        rs = requests.get(search_url, timeout=15)
-        if not rs.ok:
-            return {}
-        ad_paths = re.findall(r"/ad/\w+/[a-z0-9\-]+", rs.text, flags=re.IGNORECASE)
+            return "", ""
+        search_url = f"https://www.ispot.tv/search?q={q}"
+        rs = http_get_readable(search_url)
+        if not rs:
+            return "", ""
+        ad_paths = re.findall(r"/ad/\w+/[a-z0-9\-]+", rs, flags=re.IGNORECASE)
         if not ad_paths:
-            return {}
-        ad_url = f"{JINA}www.ispot.tv{ad_paths[0]}"
-        rp = requests.get(ad_url, timeout=15)
-        if not rp.ok:
-            return {}
-        page = rp.text
-        out = _extract_credit_fields(page)
-        if "product" not in out:
-            m = re.search(r"(?:Advertiser)\s*:\s*([^\n\r;|]+)", page, flags=re.IGNORECASE)
-            if m: out["product"] = m.group(1).strip()
-        return out
+            return "", ""
+        ad_url = f"https://www.ispot.tv{ad_paths[0]}"
+        page = http_get_readable(ad_url)
+        return ad_url, page
     except Exception:
-        return {}
+        return "", ""
 
-def scrape_shots_by_title(title: str) -> Dict[str, str]:
-    """Try shots.net search page for credit-like lines."""
+def scrape_shots_by_title(title: str) -> Tuple[str, str]:
+    """Try shots.net search page and return (url, text)."""
     try:
         q = quote_plus(title or "")
         if not q:
-            return {}
-        url = f"{JINA}www.shots.net/search?q={q}"
-        r = requests.get(url, timeout=15)
-        if not r.ok:
-            return {}
-        return _extract_credit_fields(r.text)
+            return "", ""
+        url = f"https://www.shots.net/search?q={q}"
+        page = http_get_readable(url)
+        return url, page
     except Exception:
-        return {}
+        return "", ""
 
-def gather_auto_hints(title: str, video_id: str) -> Dict[str, str]:
-    """Aggregate credits from YouTube description + iSpot + shots."""
-    combined: Dict[str, str] = {}
-    desc = fetch_youtube_description(video_id)
-    combined.update({k: v for k, v in _extract_credit_fields(desc).items() if v})
+def consolidate_credits(candidate_pages: List[Tuple[str, str]]) -> Dict[str, Dict[str, List[str]]]:
+    """
+    candidate_pages: list of (url, page_text).
+    Returns: { field: { value: [urls...] } }
+    """
+    bag: Dict[str, Dict[str, List[str]]] = {}
+    for url, text in candidate_pages:
+        if not text:
+            continue
+        fields = _extract_credit_fields(text)
+        for k, v in fields.items():
+            v_norm = v.strip()
+            if not v_norm:
+                continue
+            bag.setdefault(k, {}).setdefault(v_norm, []).append(url)
+    return bag
 
-    ispot = scrape_ispot_by_title(title or "")
-    for k, v in ispot.items():
-        if v and k not in combined:
-            combined[k] = v
-
-    shots = scrape_shots_by_title(title or "")
-    for k, v in shots.items():
-        if v and k not in combined:
-            combined[k] = v
-
-    return combined
-
-def format_auto_hints(credits: Dict[str, str]) -> str:
-    parts = []
-    if credits.get("agency"): parts.append(f"Agency: {credits['agency']}")
-    if credits.get("director"): parts.append(f"Director: {credits['director']}")
-    if credits.get("product"): parts.append(f"Product: {credits['product']}")
-    if credits.get("campaign"): parts.append(f"Campaign: {credits['campaign']}")
-    return "; ".join(parts)
-
-# ────────────────────── Naming model ───────────────────
-class Naming(BaseModel):
-    agency: str = Field("Unknown")
-    product: str = Field("Unknown")
-    campaign: str = Field("Unknown")
-    commercial: str = Field("Unknown")
-    director: str = Field("Unknown")
-    def filename(self) -> str:
-        return (
-            f"{safe_token(self.agency)}-"
-            f"{safe_token(self.product)}-"
-            f"{safe_token(self.campaign)}_"
-            f"{safe_token(self.commercial)}-"
-            f"{safe_token(self.director)}.pdf"
-        )
+def pick_credit(bag: Dict[str, Dict[str, List[str]]], key: str, min_support: int = 2) -> Tuple[str, List[str]]:
+    options = bag.get(key, {})
+    if not options:
+        return "Unknown", []
+    best_val = max(options.items(), key=lambda kv: len(kv[1]))
+    if len(best_val[1]) >= min_support:
+        return best_val[0], best_val[1]
+    return "Unknown", []
 
 # ─────────────────────── Prompts ───────────────────────
 NAMING_SYSTEM = """
@@ -217,8 +275,8 @@ Be conservative; if a proper noun is uncertain, use 'Unknown'.
 """.strip()
 
 STRUCTURED_JSON_SPEC = """
-You will receive a YouTube URL, title, channel, a timecoded transcript, and optional user 'hints'.
-Prefer the 'hints' for proper nouns and specific credits, but if hints are absent or appear inconsistent, leave fields as 'Unknown'.
+You will receive a YouTube URL, title, channel, a timecoded transcript (if available), a plain transcript, and optional user 'hints'.
+Treat the provided transcript as canonical. If other metadata contradicts it, prefer the transcript. If a line is not verbatim, append ' [inferred]'.
 Return ONLY a STRICT JSON object with keys:
 
 {
@@ -234,8 +292,8 @@ Return ONLY a STRICT JSON object with keys:
 }
 
 Rules:
-- Anchor timestamps to the timecoded transcript.
-- 'line' must be a verbatim substring of either the transcript OR the hints; if not possible, keep it short and append ' [inferred]'.
+- Anchor timestamps to the timecoded transcript if present; if not available, estimate conservatively and mark [inferred] where needed.
+- 'line' must be a verbatim substring of the transcript OR the hints; otherwise keep it short and append ' [inferred]'.
 - Prefer 8–14 scenes and 8–14 script rows for a ~30s ad (merge micro-beats if needed).
 - Keep SUPERS exact if present; otherwise empty array.
 - Be concise and concrete.
@@ -267,7 +325,7 @@ Plain transcript (may be partial):
 {{ transcript }}"""
 )
 
-# ───────────────────── LLM Helpers ─────────────────────
+# ─────────────────── LLM Helpers ─────────────────────
 def llm_json(system: str, user: str) -> Dict:
     try:
         resp = _create_with_fallback(
@@ -278,7 +336,7 @@ def llm_json(system: str, user: str) -> Dict:
         start = txt.find("{"); end = txt.rfind("}")
         return json.loads(txt[start:end+1])
     except Exception as e:
-        return {"_error": f"llm_json failed: {e}"}
+        return {"agency":"Unknown","product":"Unknown","campaign":"Unknown","commercial":"Unknown","director":"Unknown","_error": str(e)}
 
 def llm_json_structured(system: str, user: str) -> Dict:
     try:
@@ -297,8 +355,8 @@ def llm_json_structured(system: str, user: str) -> Dict:
             txt = resp.choices[0].message.content or "{}"
             start = txt.find("{"); end = txt.rfind("}")
             return json.loads(txt[start:end+1])
-        except Exception as e:
-            return {"_error": f"llm_json_structured failed: {e}"}
+        except Exception:
+            return {}
 
 def llm_html_from_json(system: str, json_payload: Dict, transcript_text: str) -> str:
     try:
@@ -313,7 +371,6 @@ def llm_html_from_json(system: str, json_payload: Dict, transcript_text: str) ->
 
 # ─────────────────── Validation / Repair ───────────────
 def _is_substring_loosely(s: str, blob: str) -> bool:
-    """Loose verbatim check (ignore case/punctuation/extra whitespace)."""
     s_norm = re.sub(r"[^\w\s]", "", (s or "").strip().lower())
     blob_norm = re.sub(r"[^\w\s]", "", (blob or "").strip().lower())
     return s_norm and (s_norm in blob_norm)
@@ -330,10 +387,10 @@ def validate_json(payload: Dict, transcript_blob: str, hints_blob: str) -> List[
     if len(script) < 6:
         errs.append(f"too_few_script_lines:{len(script)}")
     for i, sc in enumerate(scenes):
-        if not _looks_like_time(sc.get("start")):
+        if not _looks_like_time(sc.get("start", "")):
             errs.append(f"bad_scene_time_at_{i}")
     for i, row in enumerate(script):
-        if not _looks_like_time(row.get("time")):
+        if not _looks_like_time(row.get("time", "")):
             errs.append(f"bad_script_time_at_{i}")
         line = (row or {}).get("line", "")
         if line and not _is_substring_loosely(line, transcript_blob) and not _is_substring_loosely(line, hints_blob):
@@ -384,6 +441,7 @@ PDF_HTML = Template("""
     th, td { border:1px solid #e5e7eb; padding:8px; vertical-align:top }
     .ref { margin-top:18px; font-size:10pt; color:#374151 }
     ol { padding-left: 18px; }
+    a { color: #1f2937; text-decoration: none; border-bottom: 1px dotted #9ca3af; }
   </style>
 </head>
 <body>
@@ -431,6 +489,15 @@ PDF_HTML = Template("""
 
   {{ analysis_html | safe }}
 
+  {% if sources and sources|length %}
+  <h2>Sources</h2>
+  <ol>
+    {% for src in sources %}
+      <li><a href="{{ src }}">{{ src }}</a></li>
+    {% endfor %}
+  </ol>
+  {% endif %}
+
   <div class="ref"><strong>Reference:</strong> <a href="{{ url }}">{{ url }}</a></div>
 </body>
 </html>
@@ -457,7 +524,7 @@ INDEX_HTML = """
 <body>
   <div class="card">
     <h2>YouTube → Case Study PDF</h2>
-    <p class="muted">Paste a YouTube URL. Optionally add naming overrides and <strong>Hints</strong> (credits, key lines, beats, supers). We’ll return a PDF, save a JSON sidecar, and link to it for you to check.</p>
+    <p class="muted">Paste a YouTube URL and, if you have it, the full <strong>Transcript</strong>. We’ll return a PDF.</p>
     <form method="post" action="/generate">
       <label>YouTube URL</label>
       <input name="url" type="text" placeholder="https://www.youtube.com/watch?v=..." required />
@@ -470,6 +537,8 @@ INDEX_HTML = """
       </div>
       <label style="margin-top:12px">Hints / Credits / Key Lines (optional)</label>
       <textarea name="hints" placeholder=""></textarea>
+      <label style="margin-top:12px">Transcript (optional — paste if you already have it)</label>
+      <textarea name="transcript" placeholder="Paste full transcript here. If empty, we’ll try to fetch captions automatically."></textarea>
       <p style="margin-top:14px"><button class="btn" type="submit">Generate PDF</button></p>
     </form>
   </div>
@@ -494,19 +563,31 @@ SUCCESS_HTML = """
 <body>
   <div class="card">
     <h2>Success!</h2>
-    <p>The case study PDF has been generated. You can download it below.</p>
+    <p>Your PDF is ready. Download it below.</p>
     <p><a href="{{ pdf_url }}" class="btn" download>Download PDF: {{ pdf_filename }}</a></p>
-    <p class="muted">To check the AI's output for accuracy, you can also view the raw JSON sidecar.</p>
-    <p><a href="{{ json_url }}" class="btn">View Raw JSON</a></p>
-    <p style="margin-top:20px"><a href="/">Generate another video case study</a></p>
+    <p style="margin-top:20px"><a href="/">Generate another</a></p>
   </div>
 </body>
 </html>
 """
 
 # ─────────────────── Builder pipeline ──────────────────
+class Naming(BaseModel):
+    agency: str = Field("Unknown")
+    product: str = Field("Unknown")
+    campaign: str = Field("Unknown")
+    commercial: str = Field("Unknown")
+    director: str = Field("Unknown")
+    def filename(self) -> str:
+        return (
+            f"{safe_token(self.agency)}-"
+            f"{safe_token(self.product)}-"
+            f"{safe_token(self.campaign)}_"
+            f"{safe_token(self.commercial)}-"
+            f"{safe_token(self.director)}.pdf"
+        )
+
 def _fill_from_title_if_possible(naming: Naming, title: str) -> Naming:
-    """Light heuristic: try to fill product/commercial from oEmbed title if Unknown."""
     if not title:
         return naming
     if naming.product == "Unknown" or naming.commercial == "Unknown":
@@ -524,41 +605,59 @@ def _fill_from_title_if_possible(naming: Naming, title: str) -> Naming:
                 naming.commercial = parts[1].strip() or naming.commercial
     return naming
 
-def build_case_study(url: str, overrides: Optional[Dict[str, str]] = None) -> Tuple[str, str]:
+def build_case_study(url: str, overrides: Optional[Dict[str, str]] = None, provided_transcript: Optional[str] = None) -> str:
     """
-    Main pipeline to build the case study.
-    Returns: (path_to_pdf, path_to_json)
+    Returns: path_to_pdf
     """
     # Extract and fetch metadata
     vid = video_id_from_url(url)
     meta = fetch_basic_metadata(vid)
 
-    # Transcript (guard for no captions)
-    segments = fetch_transcript_segments(vid)
-    if not segments:
-        segments = [{"start": 0.0, "text": ""}]
-    timecoded = "\n".join(f"{_format_time(s['start'])}  {s['text']}" for s in segments[:220])
-    transcript_text = " ".join(s["text"] for s in segments)[:22000]
+    # Transcript handling (prefer user-provided)
+    if provided_transcript:
+        transcript_text = provided_transcript[:22000]
+        preview_lines = transcript_text.splitlines()[:20]
+        timecoded = "\n".join(preview_lines)
+    else:
+        segments = fetch_transcript_segments(vid)
+        if not segments:
+            segments = [{"start": 0.0, "text": ""}]
+        timecoded = "\n".join(f"{_format_time(s['start'])}  {s['text']}" for s in segments[:220])
+        transcript_text = " ".join(s["text"] for s in segments)[:22000]
 
-    # Auto-scrape credits before LLM
-    auto_credits = gather_auto_hints(meta.get("title", ""), vid)
-    auto_hints = format_auto_hints(auto_credits)
+    # Optional provenance scraping (kept minimal)
+    candidate_pages: List[Tuple[str, str]] = []
+    desc_txt = yt_description(f"https://www.youtube.com/watch?v={vid}") or fetch_youtube_description(vid)
+    if desc_txt:
+        candidate_pages.append((f"https://www.youtube.com/watch?v={vid}", desc_txt))
 
-    # Hints (user-provided) — merged with auto hints
-    user_hints = (overrides or {}).get("_hints", "")
-    merged_hints = "; ".join([p for p in [auto_hints, user_hints] if p]).strip()
+    bag = consolidate_credits(candidate_pages)
+    auto_agency, agency_srcs = pick_credit(bag, "agency", min_support=1)
+    auto_director, director_srcs = pick_credit(bag, "director", min_support=1)
+    auto_product, product_srcs = pick_credit(bag, "product", min_support=1)
+    auto_campaign, campaign_srcs = pick_credit(bag, "campaign", min_support=1)
 
-    # Prompt blocks
+    # Build naming via LLM (then merge any auto/user overrides)
     user_block = ANALYSIS_USER_TEMPLATE.render(
         url=url, title=meta.get("title",""), author=meta.get("author",""),
         timecoded=timecoded, transcript=transcript_text
     )
-    json_user_block = user_block + ("\n\nHINTS:\n" + merged_hints if merged_hints else "")
-
-    # 1) Naming (cautious) + overrides + tiny title heuristic
-    raw_naming = llm_json(NAMING_SYSTEM, user_block + ("\n\nHINTS:\n" + merged_hints if merged_hints else "")) or {}
+    raw_naming = llm_json(NAMING_SYSTEM, user_block) or {}
     overrides = overrides or {}
-    raw_naming.update({k:v for k,v in overrides.items() if v and k != "_hints"})
+
+    auto_overrides = {}
+    if auto_agency != "Unknown": auto_overrides["agency"] = auto_agency
+    if auto_director != "Unknown": auto_overrides["director"] = auto_director
+    if auto_product != "Unknown": auto_overrides["product"] = auto_product
+    if auto_campaign != "Unknown": auto_overrides["campaign"] = auto_campaign
+
+    for k, v in auto_overrides.items():
+        if v:
+            raw_naming[k] = v
+    for k, v in overrides.items():
+        if k != "_hints" and v:
+            raw_naming[k] = v
+
     naming = Naming(
         agency=raw_naming.get("agency","Unknown"),
         product=raw_naming.get("product","Unknown"),
@@ -568,9 +667,10 @@ def build_case_study(url: str, overrides: Optional[Dict[str, str]] = None) -> Tu
     )
     naming = _fill_from_title_if_possible(naming, meta.get("title",""))
 
-    # 2) Structured JSON (scenes + script + brand)
+    # Structured JSON (scenes + script + brand)
+    hints = overrides.get("_hints", "") if overrides else ""
+    json_user_block = user_block + ("\n\nHINTS:\n" + hints if hints else "")
     json_payload = llm_json_structured(STRUCTURED_JSON_SPEC, json_user_block)
-    # Ensure required keys exist
     json_payload.setdefault("video", {"url": url, "title": meta.get("title",""), "channel": meta.get("author","")})
     json_payload.setdefault("naming", {
         "agency": naming.agency, "product": naming.product, "campaign": naming.campaign,
@@ -581,27 +681,19 @@ def build_case_study(url: str, overrides: Optional[Dict[str, str]] = None) -> Tu
     json_payload.setdefault("brand", {
         "product": naming.product, "distinctive_assets": [], "claims": [], "ctas": []
     })
+    # (No JSON sidecar saved)
 
-    # 3) Validation + repair passes
+    # Validation and light repair
     for _ in range(REPAIR_PASSES):
-        issues = validate_json(json_payload, transcript_text, merged_hints)
+        issues = validate_json(json_payload, transcript_text, hints)
         if not issues:
             break
-        json_payload = repair_json_with_model(json_payload, transcript_text, merged_hints)
+        json_payload = repair_json_with_model(json_payload, transcript_text, hints)
 
-    # 4) Analysis strictly from JSON + transcript
+    # Analysis strictly from JSON + transcript
     analysis_html = llm_html_from_json(ANALYSIS_FROM_JSON, json_payload, transcript_text)
 
-    # Save sidecar JSON
-    json_filename = naming.filename().replace(".pdf", ".json")
-    json_path = os.path.join(OUT_DIR, json_filename)
-    try:
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(json_payload, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-    # 5) Render PDF (lazy import)
+    # Render PDF
     from weasyprint import HTML as WEASY_HTML
     heading = f"{naming.agency} – {naming.product} – {naming.campaign} – {naming.commercial} – {naming.director}"
     html = PDF_HTML.render(
@@ -612,10 +704,11 @@ def build_case_study(url: str, overrides: Optional[Dict[str, str]] = None) -> Tu
         script=json_payload["script"],
         analysis_html=analysis_html,
         url=url,
+        sources=[],  # still supported by template; we’re not adding any list here
     )
     pdf_path = os.path.join(OUT_DIR, naming.filename())
-    WEASY_HTML(string=html).write_pdf(pdf_path)
-    return pdf_path, json_path
+    WEASY_HTML(string=html, base_url=".").write_pdf(pdf_path)
+    return pdf_path
 
 # ─────────────────────── Routes ────────────────────────
 @app.get("/health")
@@ -644,18 +737,16 @@ def generate():
         "director": request.form.get("director") or None,
         "_hints": request.form.get("hints") or "",
     }
+    transcript_text = (request.form.get("transcript") or "").strip()
     try:
-        pdf_path, json_path = build_case_study(url, overrides=overrides)
+        pdf_path = build_case_study(url, overrides=overrides, provided_transcript=(transcript_text or None))
         pdf_filename = os.path.basename(pdf_path)
-        json_filename = os.path.basename(json_path)
         return render_template_string(
             SUCCESS_HTML,
             pdf_url=f"/out/{pdf_filename}",
             pdf_filename=pdf_filename,
-            json_url=f"/out/{json_filename}"
         )
     except Exception as e:
-        # Write a debug file so you can inspect errors on Render
         try:
             with open(os.path.join(OUT_DIR, "last_error.txt"), "w", encoding="utf-8") as f:
                 f.write(str(e))
@@ -664,7 +755,4 @@ def generate():
         return f"<pre>Error generating case study:\n{e}\nCheck Logs and /out/last_error.txt for details.</pre>", 400
 
 if __name__ == "__main__":
-    # Local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
-
-
