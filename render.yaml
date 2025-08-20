@@ -8,6 +8,12 @@ services:
       - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_MODEL
-        value: gpt-5.1
+        value: gpt-4o
       - key: OUT_DIR
         value: /tmp/out
+      # At least one of these for ad-trade enrichment:
+      - key: BING_SEARCH_KEY
+        sync: false
+      # OR
+      - key: SERPAPI_KEY
+        sync: false
