@@ -13,56 +13,90 @@ OUT_DIR = os.getenv("OUT_DIR", "out")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 app = Flask(__name__)
-
 # ───────────────────── OpenAI client ───────────────────
 from openai import OpenAI
 def get_client():
     return OpenAI()  # uses OPENAI_API_KEY
 
-# --- LLM JSON helper (ensures structured case study output) ---
-def llm_json(prompt: str, schema: dict = None, model: str = OPENAI_MODEL) -> dict:
-    """
-    Calls the OpenAI API and tries to return a structured JSON response.
-    Falls back gracefully if parsing fails.
-    """
-    client = get_client()
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You are an advertising strategist who outputs structured case studies in JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            response_format={"type": "json_object"}
-        )
-        content = resp.choices[0].message.content
-        return json.loads(content)
-    except Exception as e:
-        print("LLM JSON error:", e)
-        return {"error": str(e)}
+# Prefer the larger vision-capable model for detail
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
-# --- LLM helper that produces richly-detailed HTML analysis ---
-def analyze_transcript(transcript_text: str, video_title: str, channel: str, url: str) -> str:
+# --- Pull 2–3 thumbnails (no video download) to give the model visuals ---
+def get_video_thumbnails(youtube_url: str, max_imgs: int = 3) -> List[str]:
+    try:
+        import yt_dlp
+        ydl_opts = {"quiet": True, "skip_download": True, "extract_flat": True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(youtube_url, download=False)
+        thumbs = info.get("thumbnails") or []
+        # prefer highest resolution, keep top N distinct URLs
+        thumbs = sorted(thumbs, key=lambda t: (t.get("height", 0) * t.get("width", 0)), reverse=True)
+        urls, seen = [], set()
+        for t in thumbs:
+            u = t.get("url")
+            if u and u not in seen:
+                urls.append(u)
+                seen.add(u)
+            if len(urls) >= max_imgs: break
+        return urls
+    except Exception:
+        return []
+
+# --- Vague → Concrete pass: ensure nouns + strong verbs, ban generics ---
+def needs_more_concrete(detail_html: str) -> bool:
+    generic_markers = [
+        "people react", "someone", "person", "consumers", "smiling faces",
+        "various settings", "general audience", "generic", "celebrating wildly"
+    ]
+    text = detail_html.lower()
+    return any(g in text for g in generic_markers)
+
+def rewrite_more_concrete(detail_html: str) -> str:
+    client = get_client()
+    system = (
+        "You fix vague scene descriptions into concrete, filmic actions with specific subjects, "
+        "props, and motion. Keep HTML structure and timecodes identical; rewrite only the visual text."
+    )
+    user = f"""
+Rules:
+- Each scene's “What we see” must include a specific subject (e.g., “grandma”, “teen”, “line cook”, “dog”) and a strong action verb.
+- Remove generic phrasing like “people react”, “someone smiles”, “various settings”.
+- Keep the same number of scenes and the same timecodes; only improve the wording with concrete, filmic description.
+
+HTML to rewrite:
+{detail_html}
+"""
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role":"system","content":system},{"role":"user","content":user}],
+        temperature=0.5,
+        max_tokens=1800
+    )
+    html = resp.choices[0].message.content or ""
+    return html.replace("```html","").replace("```","")
+
+# --- LLM helper that produces richly detailed HTML (vision + transcript) ---
+def analyze_transcript(youtube_url: str, transcript_text: str, video_title: str, channel: str) -> str:
     """
     Produces a full HTML breakdown (scenes + annotated script + strategy sections),
-    with vivid ‘ad critic’ detail and chaos montage micro-beats.
+    with vivid ‘ad critic’ detail and chaos montage micro-beats, using transcript + 2–3 thumbnails.
     """
     client = get_client()
     system = """You are an award-winning advertising critic and storyboard analyst.
 
-When expanding transcripts into scene-by-scene breakdowns:
+When writing scene-by-scene breakdowns:
 • Do NOT just repeat dialogue.
-• Vividly describe the VISUAL ACTIONS on screen — sets, props, crowd reactions, comedic chaos, product shots, smash-cuts, spit-takes, pratfalls, drywall dives, objects breaking, pets howling, table flips, etc.
-• Expand sparse beats into cinematic description, especially absurd or over-the-top reactions common in Super Bowl spots.
+• Vividly describe the VISUAL ACTIONS — sets, props, crowd reactions, comedic chaos, product shots, smash-cuts, spit-takes, pratfalls, drywall dives, pets howling, table flips, objects breaking.
+• Expand sparse beats into cinematic detail, especially absurd, escalating “freak-out” montage moments common in Super Bowl spots.
 • Use precise, filmic nouns and action verbs (e.g., “grandma spits coffee across the table,” “guy dives head-first through drywall,” “dog howls at blender,” “chili crock pot splashes”).
-• Use ad-trade language where helpful (e.g., “freak-out montage,” “comic escalation,” “beauty shot,” “button”).
-• Keep sentences short and concrete. Ban generic phrases like “people react,” “someone,” “person,” “consumers.”
+• Use ad-trade language where helpful: “freak-out montage,” “comic escalation,” “beauty shot,” “button.”
+• Keep sentences short and concrete. Ban generic phrases: “people react,” “someone,” “person,” “consumers.”
 
-Output format: VALID HTML only (no Markdown, no triple backticks). Include these sections:
+Output: VALID HTML (no Markdown). Include ONLY these sections:
 <h2>Scene-by-Scene Description (Timecoded)</h2>
-— 12–20 scenes; each item must have [start–end], What we see, What we hear, On-screen text (if any), Purpose (why the beat exists).
+— 16–22 scenes for ~30s; each item has [start–end], What we see, What we hear, On-screen text (exact supers if known), Purpose (why the beat exists).
 <h2>Annotated Script</h2>
-— A table with Time, Script (verbatim), Director’s Notes (blocking / camera / performance), Brand/Strategy Note (communication role).
+— A table with Time, Script (verbatim), Director’s Notes (blocking / camera / performance), Brand/Strategy Note.
 <h2>What Makes It Compelling & Unique</h2>
 <h2>Creative Strategy Applied</h2>
 <h2>Campaign Objectives, Execution & Reach</h2>
@@ -71,31 +105,47 @@ Output format: VALID HTML only (no Markdown, no triple backticks). Include these
 <h2>Core Insight (The 'Big Idea')</h2>
 
 Rules:
-• If a detail is inferred beyond the transcript, append “ [inferred]” to that sentence.
-• Keep “Script (verbatim)” lines as literal substrings from the transcript where possible; if not certain, keep very short + “ [inferred]”.
+• If any visual detail is inferred beyond transcript or thumbnails, append “ [inferred]”.
+• “Script (verbatim)” must be literal substrings when possible; if not certain, keep very short + “ [inferred]”.
 • Prefer tight, specific language over generalities.
 """
-    user = f"""Video Title: {video_title}
-Channel: {channel}
-URL: {url}
 
-Transcript (canonical, may be sparse on visuals):
+    # Prepare vision inputs
+    image_urls = get_video_thumbnails(youtube_url, max_imgs=3)
+    vision_parts = []
+    for u in image_urls:
+        vision_parts.append({"type":"image_url","image_url":{"url":u}})
+
+    # Build user content with both text and images
+    user_content = []
+    if vision_parts:
+        user_content.extend(vision_parts)
+    user_text = f"""Video Title: {video_title}
+Channel: {channel}
+URL: {youtube_url}
+
+Transcript (canonical; may be sparse on visuals):
 {transcript_text}
 
 Please produce the HTML now (no Markdown)."""
+    user_content.append({"type":"text","text":user_text})
 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
             {"role": "system", "content": system},
-            {"role": "user", "content": user}
+            {"role": "user", "content": user_content}
         ],
-        temperature=0.7,
-        max_tokens=3000
+        temperature=0.8,     # a touch more creative for richer beats
+        max_tokens=3500      # allow density
     )
     html = resp.choices[0].message.content or ""
-    # Safety: strip any accidental code fences if model inserted them
-    html = html.replace("```html", "").replace("```", "")
+    html = html.replace("```html","").replace("```","")
+
+    # Post pass: enforce concrete visuals if needed
+    if needs_more_concrete(html):
+        html = rewrite_more_concrete(html)
+
     return html
 
 # ────────────────────── Utilities ──────────────────────
@@ -239,40 +289,72 @@ PDF_HTML = Template("""
 """)
 
 # ─────────────────── Builder pipeline ──────────────────
-def build_pdf_from_analysis(url: str, provided_transcript: Optional[str]) -> str:
-    # 1) Extract metadata
+def build_pdf_from_analysis(url: str, provided_transcript: Optional[str] = None) -> str:
+    """
+    Builds a director-level case study PDF from a YouTube URL and (optionally) a pasted transcript.
+    Returns the absolute path to the generated PDF file.
+    """
+    # 1) Basic metadata
     vid = video_id_from_url(url)
     meta = fetch_basic_metadata(vid)
-    title = meta.get("title", "") or "Untitled"
+    title = meta.get("title", "") or "Untitled Spot"
     channel = meta.get("author", "") or "Unknown Channel"
 
-    # 2) Transcript (prefer user-provided)
+    # 2) Transcript (prefer user-provided; else fetch captions)
     if provided_transcript and provided_transcript.strip():
-        transcript_text = provided_transcript.strip()[:24000]
+        transcript_text = provided_transcript.strip()[:30000]
     else:
         segments = fetch_transcript_segments(vid)
         if not segments:
+            # keep the pipeline alive even if no captions exist
             segments = [{"start": 0.0, "text": ""}]
-        transcript_text = " ".join(s["text"] for s in segments)[:24000]
+        transcript_text = " ".join(s.get("text", "") for s in segments)[:30000]
 
-    # 3) Get detailed HTML analysis from the model
-    analysis_html = analyze_transcript(transcript_text, title, channel, url)
-
-    # 4) Render HTML → PDF
-    from weasyprint import HTML as WEASY_HTML
-    heading = f"{title} — Case Study"
-    html = PDF_HTML.render(
-        file_title=title,
-        heading=heading,
-        title=title,
+    # 3) Ask the model for a richly detailed HTML analysis (vision + transcript)
+    analysis_html = analyze_transcript(
+        youtube_url=url,
+        transcript_text=transcript_text,
+        video_title=title,
         channel=channel,
-        analysis_html=analysis_html,
-        url=url,
     )
-    safe_name = re.sub(r"[^A-Za-z0-9_\-]+", "_", title).strip("_") or "case_study"
-    pdf_path = os.path.join(OUT_DIR, f"{safe_name}.pdf")
-    WEASY_HTML(string=html, base_url=".").write_pdf(pdf_path)
+
+    # 4) PDF shell (simple, clean stylesheet)
+    html_shell = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>{title} — Case Study</title>
+  <style>
+    body {{ font: 12pt/1.55 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color:#111; margin: 28px; }}
+    h1 {{ font-size: 20pt; margin: 0 0 8px; }}
+    h2 {{ font-size: 14pt; margin: 22px 0 10px; }}
+    hr {{ border: none; border-top: 1px solid #e5e7eb; margin: 14px 0; }}
+    .meta {{ color:#555; font-size:10pt; margin-bottom: 16px; }}
+    table {{ border-collapse: collapse; width:100%; font-size:10.5pt }}
+    th, td {{ border:1px solid #e5e7eb; padding:8px; vertical-align:top }}
+    ol {{ padding-left: 18px; }}
+    a {{ color: #1f2937; text-decoration: none; border-bottom: 1px dotted #9ca3af; }}
+    .ref {{ margin-top:18px; font-size:10pt; color:#374151 }}
+  </style>
+</head>
+<body>
+  <h1>{title} — Case Study</h1>
+  <div class="meta"><strong>Channel:</strong> {channel} &nbsp;|&nbsp; <strong>URL:</strong> <a href="{url}">{url}</a></div>
+  <hr/>
+  {analysis_html}
+  <div class="ref"><strong>Reference:</strong> <a href="{url}">{url}</a></div>
+</body>
+</html>"""
+
+    # 5) Write PDF to OUT_DIR
+    from weasyprint import HTML as WEASY_HTML
+    os.makedirs(OUT_DIR, exist_ok=True)
+    base_name = safe_token(title) or f"case_study_{safe_token(vid)}"
+    pdf_path = os.path.join(OUT_DIR, f"{base_name}.pdf")
+    WEASY_HTML(string=html_shell, base_url=".").write_pdf(pdf_path)
+
     return pdf_path
+
 
 # ─────────────────────── Routes ────────────────────────
 @app.get("/health")
