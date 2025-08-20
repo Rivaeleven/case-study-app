@@ -8,20 +8,74 @@ from youtube_transcript_api import YouTubeTranscriptApi
 import requests
 
 # ───────────────────────── ENV ─────────────────────────
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OUT_DIR = os.getenv("OUT_DIR", "out")
 os.makedirs(OUT_DIR, exist_ok=True)
 
+# Prefer the larger vision-capable model for detail (you can override via env)
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+
+# ───────────────────────── APP ─────────────────────────
 app = Flask(__name__)
+
 # ───────────────────── OpenAI client ───────────────────
 from openai import OpenAI
 def get_client():
     return OpenAI()  # uses OPENAI_API_KEY
 
-# Prefer the larger vision-capable model for detail
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+# ───────────────────── Helpers / Utils ─────────────────
+def safe_token(s: str) -> str:
+    """Filesystem-safe slug."""
+    s = (s or "").strip()
+    s = re.sub(r"\s+", "_", s)
+    return re.sub(r"[^A-Za-z0-9_\-]", "", s) or "file"
 
-# --- Pull 2–3 thumbnails (no video download) to give the model visuals ---
+def video_id_from_url(url: str) -> str:
+    q = urlparse(url)
+    if q.hostname in ("youtu.be",):
+        return q.path.lstrip("/")
+    if q.hostname and "youtube.com" in q.hostname:
+        vid = parse_qs(q.query).get("v", [None])[0]
+        if vid:
+            return vid
+    raise ValueError("Could not extract YouTube video id from URL.")
+
+def _format_time(seconds: float) -> str:
+    m = int(seconds // 60)
+    s = int(round(seconds % 60))
+    return f"{m:02d}:{s:02d}"
+
+def fetch_basic_metadata(video_id: str) -> Dict[str, str]:
+    """YouTube oEmbed for title/author (quick, no API key)."""
+    try:
+        r = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": f"https://www.youtube.com/watch?v={video_id}", "format": "json"},
+            timeout=15,
+        )
+        if r.ok:
+            j = r.json()
+            return {"title": j.get("title", ""), "author": j.get("author_name", "")}
+    except Exception:
+        pass
+    return {"title": "", "author": ""}
+
+def fetch_transcript_segments(video_id: str) -> List[Dict]:
+    """Return list of segments with start times and text; empty list if missing."""
+    try:
+        trs = YouTubeTranscriptApi.list_transcripts(video_id)
+        try:
+            t = trs.find_transcript(["en", "en-US"]).fetch()
+        except Exception:
+            t = YouTubeTranscriptApi.get_transcript(video_id)
+        return [
+            {"start": float(seg.get("start", 0.0)), "text": seg.get("text", "")}
+            for seg in t
+            if seg.get("text", "").strip()
+        ]
+    except Exception:
+        return []
+
+# ───────────── Thumbnails (vision grounding, no download) ──────────
 def get_video_thumbnails(youtube_url: str, max_imgs: int = 3) -> List[str]:
     try:
         import yt_dlp
@@ -37,18 +91,19 @@ def get_video_thumbnails(youtube_url: str, max_imgs: int = 3) -> List[str]:
             if u and u not in seen:
                 urls.append(u)
                 seen.add(u)
-            if len(urls) >= max_imgs: break
+            if len(urls) >= max_imgs:
+                break
         return urls
     except Exception:
         return []
 
-# --- Vague → Concrete pass: ensure nouns + strong verbs, ban generics ---
+# ───────────── Vague → Concrete pass (post-rewrite) ────────────────
 def needs_more_concrete(detail_html: str) -> bool:
     generic_markers = [
         "people react", "someone", "person", "consumers", "smiling faces",
         "various settings", "general audience", "generic", "celebrating wildly"
     ]
-    text = detail_html.lower()
+    text = (detail_html or "").lower()
     return any(g in text for g in generic_markers)
 
 def rewrite_more_concrete(detail_html: str) -> str:
@@ -73,9 +128,9 @@ HTML to rewrite:
         max_tokens=1800
     )
     html = resp.choices[0].message.content or ""
-    return html.replace("```html","").replace("```","")
+    return html.replace("```html", "").replace("```", "")
 
-# --- LLM helper that produces richly detailed HTML (vision + transcript) ---
+# ───────────── LLM: vision + transcript detailed analysis ──────────
 def analyze_transcript(youtube_url: str, transcript_text: str, video_title: str, channel: str) -> str:
     """
     Produces a full HTML breakdown (scenes + annotated script + strategy sections),
@@ -109,12 +164,11 @@ Rules:
 • “Script (verbatim)” must be literal substrings when possible; if not certain, keep very short + “ [inferred]”.
 • Prefer tight, specific language over generalities.
 """
-
     # Prepare vision inputs
     image_urls = get_video_thumbnails(youtube_url, max_imgs=3)
     vision_parts = []
     for u in image_urls:
-        vision_parts.append({"type":"image_url","image_url":{"url":u}})
+        vision_parts.append({"type": "image_url", "image_url": {"url": u}})
 
     # Build user content with both text and images
     user_content = []
@@ -128,7 +182,7 @@ Transcript (canonical; may be sparse on visuals):
 {transcript_text}
 
 Please produce the HTML now (no Markdown)."""
-    user_content.append({"type":"text","text":user_text})
+    user_content.append({"type": "text", "text": user_text})
 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
@@ -140,59 +194,13 @@ Please produce the HTML now (no Markdown)."""
         max_tokens=3500      # allow density
     )
     html = resp.choices[0].message.content or ""
-    html = html.replace("```html","").replace("```","")
+    html = html.replace("```html", "").replace("```", "")
 
     # Post pass: enforce concrete visuals if needed
     if needs_more_concrete(html):
         html = rewrite_more_concrete(html)
 
     return html
-
-# ────────────────────── Utilities ──────────────────────
-def video_id_from_url(url: str) -> str:
-    q = urlparse(url)
-    if q.hostname in ("youtu.be",):
-        return q.path.lstrip("/")
-    if q.hostname and "youtube.com" in q.hostname:
-        vid = parse_qs(q.query).get("v", [None])[0]
-        if vid:
-            return vid
-    raise ValueError("Could not extract YouTube video id from URL.")
-
-def _format_time(seconds: float) -> str:
-    m = int(seconds // 60)
-    s = int(round(seconds % 60))
-    return f"{m:02d}:{s:02d}"
-
-def fetch_basic_metadata(video_id: str) -> Dict[str, str]:
-    try:
-        r = requests.get(
-            "https://www.youtube.com/oembed",
-            params={"url": f"https://www.youtube.com/watch?v={video_id}", "format": "json"},
-            timeout=15,
-        )
-        if r.ok:
-            j = r.json()
-            return {"title": j.get("title", ""), "author": j.get("author_name", "")}
-    except Exception:
-        pass
-    return {"title": "", "author": ""}
-
-def fetch_transcript_segments(video_id: str) -> List[Dict]:
-    """Return list of segments with start times and text; empty list if missing."""
-    try:
-        trs = YouTubeTranscriptApi.list_transcripts(video_id)
-        try:
-            t = trs.find_transcript(["en", "en-US"]).fetch()
-        except Exception:
-            t = YouTubeTranscriptApi.get_transcript(video_id)
-        return [
-            {"start": float(seg.get("start", 0.0)), "text": seg.get("text", "")}
-            for seg in t
-            if seg.get("text", "").strip()
-        ]
-    except Exception:
-        return []
 
 # ─────────────────── HTML Templates ────────────────────
 INDEX_HTML = """
@@ -354,7 +362,6 @@ def build_pdf_from_analysis(url: str, provided_transcript: Optional[str] = None)
     WEASY_HTML(string=html_shell, base_url=".").write_pdf(pdf_path)
 
     return pdf_path
-
 
 # ─────────────────────── Routes ────────────────────────
 @app.get("/health")
