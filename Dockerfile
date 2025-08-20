@@ -12,15 +12,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-dejavu-core \
  && rm -rf /var/lib/apt/lists/*
 
-
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-
-ENV PORT=8080 PYTHONUNBUFFERED=1 OUT_DIR=/tmp/out
+ENV OUT_DIR=/tmp/out PYTHONUNBUFFERED=1
 RUN mkdir -p $OUT_DIR
-EXPOSE 8080
 
-# If your app file is App.py, change app:app -> App:app
+EXPOSE 8080
 CMD ["bash","-lc","gunicorn -w 2 -b 0.0.0.0:$PORT app:app --timeout 300"]
