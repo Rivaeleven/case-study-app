@@ -353,14 +353,17 @@ Plain transcript (may be partial):
 )
 
 # ─────────────────── LLM Helpers ─────────────────────
-def llm_json(system: str, user: str) -> Dict:
-    try:
-        resp = _create_with_fallback(
-            model=OPENAI_MODEL,
-          messages=[
-    {
-        "role": "system",
-        "content": """You are an award-winning advertising critic. 
+# --- LLM Helper Function ---
+def analyze_transcript(transcript_text: str) -> str:
+    from openai import OpenAI
+    client = OpenAI()
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": """You are an award-winning advertising critic.
 When expanding transcripts into scene-by-scene breakdowns:
 
 • Do not just repeat dialogue.  
@@ -373,21 +376,26 @@ When expanding transcripts into scene-by-scene breakdowns:
    – What we hear (dialogue, VO, music, sfx)  
    – Purpose/strategy of the beat (brand intent)  
 
-After the scene breakdown, include sections:  
-- Annotated Script (verbatim + critic notes)  
-- What Makes It Compelling & Unique  
-- Creative Strategy Applied  
-- Campaign Objectives, Execution & Reach  
-- Performance & Audience Impact  
-- Why It’s Award-Worthy  
-- Core Insight (The Big Idea)  
+After the scene breakdown, include sections:
+- Annotated Script (verbatim + critic notes)
+- What Makes It Compelling & Unique
+- Creative Strategy Applied
+- Campaign Objectives, Execution & Reach
+- Performance & Audience Impact
+- Why It’s Award-Worthy
+- Core Insight (The Big Idea)
 """
-    },
-    {
-        "role": "user",
-        "content": f"Transcript:\n{transcript_text}\n\nNow expand into a full ad breakdown."
-    }
-]
+            },
+            {
+                "role": "user",
+                "content": f"Transcript:\n{transcript_text}\n\nNow expand into a full ad breakdown."
+            }
+        ],
+        temperature=0.7,
+        max_tokens=2000
+    )
+
+    return response.choices[0].message["content"]
 
 
 # ─────────────────── Validation / Repair ─────────────
