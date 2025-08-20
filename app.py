@@ -245,7 +245,7 @@ def enrich_from_trades(title: str, brand_hint: str = "") -> Dict[str, List[str]]
         "sources": list({*voice_srcs, *direc_srcs, *agcy_srcs})
     }
 
-# ─────────────────────── Prompts (UPGRADED) ───────────────────────
+# ─────────────────────── Prompts ───────────────────────
 NAMING_SYSTEM = """
 Extract (or infer cautiously) the work's naming fields from the provided text.
 We will give you a YouTube URL, title and channel, plus transcript.
@@ -296,6 +296,36 @@ Rules and tone:
 - "audio" should include VO/SFX/music cues; use short verbatim where possible.
 - "line" MUST be a verbatim substring of the transcript when possible; otherwise keep it brief and append " [inferred]".
 - Use short, tight sentences. No buzzwords.
+""".strip()
+
+# ★ NEW: Chaos Montage expansion step
+CHAOS_MONTAGE_SPEC = """
+You are given:
+- The plain transcript for a commercial (canonical dialogue).
+- The current scene list (already extracted).
+
+Task:
+Identify every QUICK-CUT gag, physical bit, background reaction, visual joke, stunt, prop-gag, spit-take, crash, fall, explosion, or micro-beat that likely appears in a fast 'chaos montage' sequence. These are often 0.3–1.0s shots layered around lines like "No!" / "Yes!" / "Wait!" or similar emotional pivots.
+
+Return ONLY:
+{
+  "scenes_augmented": [
+    {
+      "start": "mm:ss",
+      "end": "mm:ss" | null,
+      "visual": "extremely concrete physical action (who/what, props, motion, environment). If timing is estimated, add ' [inferred]'.",
+      "audio": "VO/SFX/music, short verbatim if possible; append ' [inferred]' if not certain.",
+      "on_screen_text": [],
+      "purpose": "why this micro-beat exists (e.g., heighten panic, punctuate joke, add absurdity, product beauty, etc.)"
+    }
+  ]
+}
+
+Rules:
+- Prefer many short micro-beats (0.3–1.0s implied). DO NOT write generic "people react". Spell out actions (e.g., "grandma spits coffee", "man dives through drywall", "dog howls", "table flips", "guy dunks face in chili").
+- Keep times aligned to nearest sensible second from transcript beats. If unknown: choose a plausible nearby time and add ' [inferred]'.
+- Do not duplicate existing scenes; add new ones that increase visual specificity.
+- Keep language tight, concrete, and filmic (blocking, props, motion).
 """.strip()
 
 ANALYSIS_FROM_JSON = """
@@ -456,9 +486,35 @@ def _fill_from_title_if_possible(naming: Naming, title: str) -> Naming:
                 naming.commercial = parts[1].strip() or naming.commercial
     return naming
 
+def chaos_augment_scenes(current_scenes: List[Dict], transcript_text: str) -> List[Dict]:
+    """Ask the model to add micro-beat chaos montage gags, then merge."""
+    try:
+        user_blob = json.dumps({"scenes": current_scenes, "transcript": transcript_text}, ensure_ascii=False)
+        resp = _create_with_fallback(
+            model=OPENAI_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": CHAOS_MONTAGE_SPEC},
+                {"role": "user", "content": user_blob},
+            ],
+        )
+        payload = json.loads(resp.choices[0].message.content or "{}")
+        aug = payload.get("scenes_augmented") or []
+        # De-dup: avoid identical visual+start pairs
+        seen_keys = { (sc.get("start",""), sc.get("visual","").strip().lower()) for sc in current_scenes }
+        merged = list(current_scenes)
+        for sc in aug:
+            key = (sc.get("start",""), (sc.get("visual","") or "").strip().lower())
+            if key not in seen_keys:
+                merged.append(sc)
+                seen_keys.add(key)
+        return merged
+    except Exception:
+        return current_scenes
+
 def build_case_study(url: str, provided_transcript: Optional[str] = None) -> str:
     """
-    Build the PDF (with richer, director-level scene detail) and return its file path.
+    Build the PDF (with richer, director-level scene detail + chaos montage) and return its file path.
     """
     # Extract and fetch metadata
     vid = video_id_from_url(url)
@@ -517,6 +573,9 @@ def build_case_study(url: str, provided_transcript: Optional[str] = None) -> str
     detailed_payload.setdefault("brand", {
         "product": naming.product, "distinctive_assets": [], "claims": [], "ctas": []
     })
+
+    # ★ Chaos Montage augmentation (adds micro-beats to scenes)
+    detailed_payload["scenes"] = chaos_augment_scenes(detailed_payload["scenes"], transcript_text)
 
     # Validation & repair to enforce density + verbatim lines
     for _ in range(REPAIR_PASSES):
