@@ -357,45 +357,38 @@ def llm_json(system: str, user: str) -> Dict:
     try:
         resp = _create_with_fallback(
             model=OPENAI_MODEL,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        )
-        txt = resp.choices[0].message.content or ""
-        start = txt.find("{"); end = txt.rfind("}")
-        return json.loads(txt[start:end+1])
-    except Exception:
-        return {"agency":"Unknown","product":"Unknown","campaign":"Unknown","commercial":"Unknown","director":"Unknown"}
+          messages=[
+    {
+        "role": "system",
+        "content": """You are an award-winning advertising critic. 
+When expanding transcripts into scene-by-scene breakdowns:
 
-def llm_json_structured(system: str, user: str) -> Dict:
-    try:
-        resp = _create_with_fallback(
-            model=OPENAI_MODEL,
-            response_format={"type": "json_object"},
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        )
-        return json.loads(resp.choices[0].message.content or "{}")
-    except Exception:
-        # permissive fallback parse
-        try:
-            resp = _create_with_fallback(
-                model=OPENAI_MODEL,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            )
-            txt = resp.choices[0].message.content or "{}"
-            start = txt.find("{"); end = txt.rfind("}")
-            return json.loads(txt[start:end+1])
-        except Exception:
-            return {}
+• Do not just repeat dialogue.  
+• Vividly describe the VISUAL ACTIONS on screen — sets, props, crowd reactions, comedic chaos, product shots.  
+• Expand sparse beats into full cinematic description, especially absurd or over-the-top reactions typical of Super Bowl spots.  
+• Use ad-trade language (e.g. “physical freak-out montage,” “grandma does a spit take,” “director Harold Einstein leans into absurdist escalation”).  
+• Always provide:  
+   – Timecoded scene description  
+   – What we see (visuals)  
+   – What we hear (dialogue, VO, music, sfx)  
+   – Purpose/strategy of the beat (brand intent)  
 
-def llm_html_from_json(system: str, json_payload: Dict, transcript_text: str) -> str:
-    try:
-        user_blob = json.dumps({"json": json_payload, "transcript": transcript_text}, ensure_ascii=False)
-        resp = _create_with_fallback(
-            model=OPENAI_MODEL,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user_blob}],
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        return f"<p><em>analysis generation failed:</em> {e}</p>"
+After the scene breakdown, include sections:  
+- Annotated Script (verbatim + critic notes)  
+- What Makes It Compelling & Unique  
+- Creative Strategy Applied  
+- Campaign Objectives, Execution & Reach  
+- Performance & Audience Impact  
+- Why It’s Award-Worthy  
+- Core Insight (The Big Idea)  
+"""
+    },
+    {
+        "role": "user",
+        "content": f"Transcript:\n{transcript_text}\n\nNow expand into a full ad breakdown."
+    }
+]
+
 
 # ─────────────────── Validation / Repair ─────────────
 def _is_substring_loosely(s: str, blob: str) -> bool:
