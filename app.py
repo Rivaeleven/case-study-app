@@ -1,6 +1,6 @@
 import os, re, json
 from urllib.parse import urlparse, parse_qs
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from flask import Flask, request, render_template_string, send_from_directory, abort
 from jinja2 import Template
@@ -11,14 +11,14 @@ import requests
 OUT_DIR = os.getenv("OUT_DIR", "out")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# Use vision-capable model for thumbnails + strong reasoning for grounding passes
+# Models: vision for thumbnails; text for structured writing
 OPENAI_MODEL_VISION = os.getenv("OPENAI_MODEL_VISION", "gpt-4o")
 OPENAI_MODEL_TEXT   = os.getenv("OPENAI_MODEL_TEXT", "gpt-4o")
 
 # ───────────────────── OpenAI client ───────────────────
 from openai import OpenAI
 def get_client():
-    return OpenAI()  # reads OPENAI_API_KEY
+    return OpenAI()  # needs OPENAI_API_KEY
 
 # ───────────────────── Flask app ───────────────────────
 app = Flask(__name__)
@@ -37,11 +37,6 @@ def video_id_from_url(url: str) -> str:
         if vid:
             return vid
     raise ValueError("Could not extract YouTube video id from URL.")
-
-def _format_time(seconds: float) -> str:
-    m = int(seconds // 60)
-    s = int(round(seconds % 60))
-    return f"{m:02d}:{s:02d}"
 
 def fetch_basic_metadata(video_id: str) -> Dict[str, str]:
     try:
@@ -73,8 +68,8 @@ def fetch_transcript_segments(video_id: str) -> List[Dict]:
     except Exception:
         return []
 
-# Pull a few high-res thumbnails so the model can “see” what’s actually on screen
 def get_video_thumbnails(youtube_url: str, max_imgs: int = 3) -> List[str]:
+    """Grab a few high-res thumbnail URLs (no download)."""
     try:
         import yt_dlp
         ydl_opts = {"quiet": True, "skip_download": True, "extract_flat": True}
@@ -86,13 +81,22 @@ def get_video_thumbnails(youtube_url: str, max_imgs: int = 3) -> List[str]:
         for t in thumbs:
             u = t.get("url")
             if u and u not in seen:
-                urls.append(u)
-                seen.add(u)
-            if len(urls) >= max_imgs:
-                break
+                urls.append(u); seen.add(u)
+            if len(urls) >= max_imgs: break
         return urls
     except Exception:
         return []
+
+# ───────────── Tiny helpers for formatting ─────────────
+def compact_transcript(transcript_text: str, max_chars=1800) -> str:
+    t = re.sub(r"\s+", " ", transcript_text or "").strip()
+    return t[:max_chars]
+
+def contains_generic(text: str) -> bool:
+    if not text: return False
+    bad = ["abstract graphics", "various settings", "people react", "someone", "person", "consumers", "generic"]
+    tl = text.lower()
+    return any(b in tl for b in bad)
 
 # ───────────────── HTML shells ─────────────────────────
 INDEX_HTML = """
@@ -115,12 +119,14 @@ INDEX_HTML = """
 <body>
   <div class="card">
     <h2>YouTube → Case Study PDF</h2>
-    <p class="muted">Paste a YouTube URL and (optionally) a full transcript. We’ll generate a detailed, grounded breakdown and auto-download the PDF.</p>
+    <p class="muted">Paste a YouTube URL and (optionally) a full transcript + any Director’s Hints. We’ll generate a clean, detailed breakdown and auto-download the PDF.</p>
     <form method="post" action="/generate">
       <label>YouTube URL</label>
       <input name="url" type="text" placeholder="https://www.youtube.com/watch?v=..." required />
-      <label style="margin-top:12px">Transcript (optional — paste if you already have it)</label>
+      <label style="margin-top:12px">Transcript (optional)</label>
       <textarea name="transcript" placeholder="Paste full transcript here. If empty, we’ll try to fetch captions automatically."></textarea>
+      <label style="margin-top:12px">Director’s Hints (optional)</label>
+      <textarea name="hints" placeholder="Describe what’s on screen that you know is true (e.g., living-room watch party; VO only; no on-camera spokesperson; montage of NO → YES reactions; final product end card)."></textarea>
       <p style="margin-top:14px"><button class="btn" type="submit">Generate PDF</button></p>
     </form>
   </div>
@@ -150,7 +156,6 @@ SUCCESS_HTML = """
     <p style="margin-top:20px"><a href="/">Generate another video case study</a></p>
   </div>
   <script>
-    // auto-download
     (function(){ const a = document.createElement('a'); a.href = "{{ pdf_url }}"; a.download = "{{ pdf_filename }}"; document.body.appendChild(a); a.click(); a.remove(); })();
   </script>
 </body>
@@ -168,17 +173,16 @@ PDF_HTML = Template("""
     h1 { font-size: 20pt; margin: 0 0 8px; }
     h2 { font-size: 14pt; margin: 22px 0 10px; }
     hr { border: none; border-top: 1px solid #e5e7eb; margin: 14px 0; }
-    .meta { color:#555; font-size:10pt; margin-bottom: 16px; }
+    p, li { font-size: 11.5pt; }
+    ul { margin: 0 0 0 20px; }
     a { color:#1f2937; text-decoration: none; border-bottom: 1px dotted #9ca3af; }
-    table { border-collapse: collapse; width:100%; font-size:10.5pt }
-    th, td { border:1px solid #e5e7eb; padding:8px; vertical-align:top }
-    ol { padding-left: 18px; }
     .ref { margin-top:18px; font-size:10pt; color:#374151 }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
   </style>
 </head>
 <body>
-  <h1>{{ heading }}</h1>
-  <div class="meta"><strong>Channel:</strong> {{ channel }} &nbsp;|&nbsp; <strong>URL:</strong> <a href="{{ url }}">{{ url }}</a></div>
+  <h1 class="mono">{{ heading }}</h1>
+  <div style="color:#555;margin-bottom:16px"><strong>Channel:</strong> {{ channel }} &nbsp;|&nbsp; <strong>URL:</strong> <a href="{{ url }}">{{ url }}</a></div>
   <hr/>
   {{ analysis_html | safe }}
   <div class="ref"><strong>Reference:</strong> <a href="{{ url }}">{{ url }}</a></div>
@@ -186,152 +190,100 @@ PDF_HTML = Template("""
 </html>
 """)
 
-# ─────────────── LLM passes (EVIDENCE → WRITE → SCRUB) ───────────────
-def call_json(system: str, user_content, model: str, temperature: float = 0.2) -> Dict:
+# ───────────── LLM calls ─────────────
+def call_text(system: str, user, model: str, temperature: float, max_tokens: int = 3200) -> str:
     client = get_client()
     resp = client.chat.completions.create(
         model=model,
-        messages=[{"role":"system","content":system},{"role":"user","content":user_content}],
-        response_format={"type":"json_object"},
-        temperature=temperature,
-    )
-    try:
-        return json.loads(resp.choices[0].message.content or "{}")
-    except Exception:
-        return {}
-
-def call_text(system: str, user_content, model: str, temperature: float = 0.3, max_tokens: int = 3000) -> str:
-    client = get_client()
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role":"system","content":system},{"role":"user","content":user_content}],
+        messages=[{"role":"system","content":system},{"role":"user","content":user}],
         temperature=temperature,
         max_tokens=max_tokens
     )
-    txt = resp.choices[0].message.content or ""
-    return txt.replace("```html","").replace("```","")
+    return (resp.choices[0].message.content or "").replace("```html","").replace("```","")
 
-def build_evidence(youtube_url: str, transcript_text: str, title: str, channel: str, image_urls: List[str]) -> Dict:
-    sys = (
-        "You extract **ground truth evidence** from thumbnails + transcript. "
-        "Only report what is visible in thumbnails or explicit in transcript. Be conservative."
-    )
+def analyze_to_template(youtube_url: str, transcript_text: str, title: str, channel: str, hints: str) -> str:
+    """
+    Produce a STRICT, minimal template:
+    - Big Idea (tight)
+    - Scene-by-Scene Breakdown (timecoded, 12–18 beats, ultra concrete)
+    - Why It Works (3 bullets)
+    """
+    # Compact transcript for context; we still keep it canonical for verbatim lines
+    transcript_compact = compact_transcript(transcript_text, max_chars=2200)
+    # Pull thumbnails
+    thumbs = get_video_thumbnails(youtube_url, max_imgs=3)
+
+    # System prompt forces the exact structure you want
+    system = """You are an advertising analyst. Your job is to write a concise, concrete breakdown in a fixed template.
+
+Hard rules:
+- Use the transcript for verbatim VO/dialogue lines only (short snippets).
+- Use Director’s Hints as ground truth for visuals if present; otherwise infer conservatively from transcript and thumbnails.
+- No on-camera spokesperson unless clearly supported by hints or thumbnails.
+- Ban generic phrases: “abstract graphics”, “people react”, “someone”, “various settings”, “consumers”.
+- Use short filmic nouns/verbs (crowd, couch, confetti, cooler, TV, end card, pack shot).
+- If a visual is not in the hints or thumbnails, append “ [inferred]”.
+
+Output MUST be VALID HTML with EXACTLY these sections and styles:
+<h2 class="mono">Big Idea</h2>
+<p>2–5 tight sentences.</p>
+
+<h2 class="mono">Scene-by-Scene Breakdown (Timecoded)</h2>
+<ol>
+  <li>
+    <div class="mono">0:00 — Beat name.</div>
+    <div><strong>VO/Dialogue:</strong> "verbatim line..."</div>
+    <div><strong>Visual:</strong> concrete, specific action (append “ [inferred]” if not grounded)</div>
+  </li>
+  ... 12–18 items total ...
+</ol>
+
+<h2 class="mono">Why It Works</h2>
+<ul>
+  <li>Rhythmic tension & release …</li>
+  <li>Protecting tradition while innovating …</li>
+  <li>Simple, repeatable device …</li>
+</ul>
+"""
+
+    # User payload with thumbnails + text context
     user_payload = []
-    for u in image_urls:
+    for u in thumbs:
         user_payload.append({"type":"image_url","image_url":{"url":u}})
     user_text = f"""
-Title: {title}
-Channel: {channel}
+TITLE: {title}
+CHANNEL: {channel}
 URL: {youtube_url}
 
-Transcript (canonical, may lack visuals):
-{transcript_text}
+DIRECTOR_HINTS (authoritative if plausible):
+{hints or "(none)"}
 
-Return STRICT JSON:
-{{
-  "people_visible": boolean,
-  "voiceover_only_likely": boolean,        // true if transcript is VO without visible speaker
-  "settings": [string],                     // e.g., "kitchen", "studio", "abstract graphics"
-  "product_shot_types": [string],           // e.g., "pack shot", "beauty pour", "logo end card"
-  "on_screen_text": [string],               // exact SUPERS if legible; else empty
-  "notable_props": [string],
-  "num_people_estimate": integer,           // 0 if none seen
-  "confidence": number                      // 0.0–1.0
-}}
-Rules:
-- If thumbnails show only product/graphics, people_visible=false.
-- If no face/mouth-on-camera evidence and transcript is disembodied VO, set voiceover_only_likely=true.
-- If you are not sure, choose the safer (more restrictive) option.
+TRANSCRIPT (canonical; use for verbatim quotes):
+{transcript_compact}
+
+Now write the HTML exactly in the requested structure and tone.
 """
     user_payload.append({"type":"text","text":user_text})
-    return call_json(sys, user_payload, OPENAI_MODEL_VISION, temperature=0.1)
 
-def write_scene_html_from_evidence(youtube_url: str, transcript_text: str, title: str, channel: str, evidence: Dict) -> str:
-    sys = """You are an award-winning advertising critic and storyboard analyst.
+    html = call_text(system, user_payload, OPENAI_MODEL_VISION, temperature=0.15, max_tokens=3300)
 
-STRICT RULES:
-• Do NOT invent humans, rooms, clothing, or props not supported by EVIDENCE. If evidence.people_visible=false or evidence.voiceover_only_likely=true, **no on-camera spokesperson**.
-• Prefer product-only visuals when evidence is sparse.
-• Any deduction must end with " [inferred]".
-• Use concrete filmic nouns/verbs. Ban generic phrases (“people react”, “someone”, “various settings”).
-• Keep sentences short.
+    # If the model drifted into generic wording, run a scrubber pass
+    if contains_generic(html):
+        scrub_sys = """You are a scrubber. Replace vague or generic visuals with concrete actions,
+without inventing on-camera spokespersons. If not grounded by hints/thumbnails, append “ [inferred]”.
+Keep the SAME HTML structure/tags/timecodes."""
+        html = call_text(scrub_sys, html, OPENAI_MODEL_TEXT, temperature=0.0, max_tokens=3300)
 
-OUTPUT: VALID HTML (no Markdown) with EXACTLY these sections:
-<h2>Scene-by-Scene Description (Timecoded)</h2>
-— 12–18 scenes for ~30s; each item has [start–end], What we see, What we hear, On-screen text (exact supers), Purpose.
-<h2>Annotated Script</h2>
-— Table: Time | Script (verbatim) | Director’s Notes | Brand/Strategy Note
-<h2>What Makes It Compelling & Unique</h2>
-<h2>Creative Strategy Applied</h2>
-<h2>Campaign Objectives, Execution & Reach</h2>
-<h2>Performance & Audience Impact</h2>
-<h2>Why It’s Award-Worthy</h2>
-<h2>Core Insight (The 'Big Idea')</h2>
-"""
-    user = f"""
-EVIDENCE (ground truth):
-{json.dumps(evidence, ensure_ascii=False, indent=2)}
-
-Title: {title}
-Channel: {channel}
-URL: {youtube_url}
-
-Transcript (canonical; prefer verbatim for Script column):
-{transcript_text}
-
-Write the HTML now. Remember: stay within evidence bounds. If people_visible=false, do NOT add humans; lean on product shots and graphics.
-"""
-    return call_text(sys, user, OPENAI_MODEL_TEXT, temperature=0.25, max_tokens=3500)
-
-def scrub_hallucinations(html: str, evidence: Dict, transcript_text: str) -> str:
-    sys = """You are a hallucination scrubber. Remove or rewrite any lines that assert visuals not supported by evidence.
-Rules:
-- If evidence.people_visible=false, delete any mention of on-camera people, rooms, clothing, faces, or dialogue delivered by visible speakers.
-- Only keep on-screen text that is in evidence.on_screen_text.
-- Keep product shots, logos, pours, end cards described in evidence.product_shot_types.
-- Preserve structure and headings; keep timecodes; tighten wording.
-- If uncertain, omit rather than guess.
-Output VALID HTML only."""
-    user = f"""EVIDENCE:
-{json.dumps(evidence, ensure_ascii=False, indent=2)}
-
-TRANSCRIPT:
-{transcript_text}
-
-HTML TO SCRUB:
-{html}
-"""
-    return call_text(sys, user, OPENAI_MODEL_TEXT, temperature=0.0, max_tokens=3500)
-
-# Main analysis orchestrator
-def analyze_transcript_grounded(youtube_url: str, transcript_text: str, video_title: str, channel: str) -> str:
-    # 1) thumbnails
-    image_urls = get_video_thumbnails(youtube_url, max_imgs=3)
-
-    # 2) evidence (conservative)
-    evidence = build_evidence(youtube_url, transcript_text, video_title, channel, image_urls)
-
-    # 3) write under constraints
-    raw_html = write_scene_html_from_evidence(youtube_url, transcript_text, video_title, channel, evidence)
-
-    # 4) scrub for any unsupported claims
-    clean_html = scrub_hallucinations(raw_html, evidence, transcript_text)
-
-    return clean_html
+    return html
 
 # ─────────────────── Builder pipeline ──────────────────
-def build_pdf_from_analysis(url: str, provided_transcript: Optional[str] = None) -> str:
-    """
-    Builds a grounded, director-level case study PDF from a YouTube URL and (optionally) a pasted transcript.
-    Returns the absolute path to the generated PDF file.
-    """
-    # 1) Basic metadata
+def build_pdf_from_template(url: str, provided_transcript: Optional[str], hints: Optional[str]) -> str:
     vid = video_id_from_url(url)
     meta = fetch_basic_metadata(vid)
     title = meta.get("title", "") or "Untitled Spot"
     channel = meta.get("author", "") or "Unknown Channel"
 
-    # 2) Transcript (prefer user-provided; else fetch captions)
+    # Transcript
     if provided_transcript and provided_transcript.strip():
         transcript_text = provided_transcript.strip()[:30000]
     else:
@@ -340,15 +292,16 @@ def build_pdf_from_analysis(url: str, provided_transcript: Optional[str] = None)
             segments = [{"start": 0.0, "text": ""}]
         transcript_text = " ".join(s.get("text", "") for s in segments)[:30000]
 
-    # 3) Grounded analysis (vision + transcript with evidence and scrub)
-    analysis_html = analyze_transcript_grounded(
+    # Analysis in the strict template
+    analysis_html = analyze_to_template(
         youtube_url=url,
         transcript_text=transcript_text,
-        video_title=title,
+        title=title,
         channel=channel,
+        hints=hints or "",
     )
 
-    # 4) Render PDF
+    # Render PDF
     from weasyprint import HTML as WEASY_HTML
     base_name = safe_token(title) or f"case_study_{safe_token(vid)}"
     heading = f"{title} — Case Study"
@@ -375,7 +328,6 @@ def index():
 @app.get("/out/<path:filename>")
 def get_file(filename):
     try:
-        # as_attachment=True so browsers treat it as a download
         return send_from_directory(OUT_DIR, filename, as_attachment=True)
     except Exception:
         abort(404)
@@ -384,8 +336,9 @@ def get_file(filename):
 def generate():
     url = request.form.get("url", "").strip()
     transcript_text = (request.form.get("transcript") or "").strip()
+    hints = (request.form.get("hints") or "").strip()
     try:
-        pdf_path = build_pdf_from_analysis(url, provided_transcript=transcript_text or None)
+        pdf_path = build_pdf_from_template(url, provided_transcript=transcript_text or None, hints=hints or None)
         pdf_filename = os.path.basename(pdf_path)
         return render_template_string(
             SUCCESS_HTML,
