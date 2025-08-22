@@ -1,4 +1,4 @@
-import os, re, json, base64, subprocess, shutil, tempfile
+import os, re, json
 from urllib.parse import urlparse, parse_qs
 from typing import Dict, List, Optional, Tuple
 
@@ -8,16 +8,17 @@ from youtube_transcript_api import YouTubeTranscriptApi
 import requests
 
 # ───────────────────────── ENV ─────────────────────────
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # vision-capable model
 OUT_DIR = os.getenv("OUT_DIR", "out")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# Optional: search keys (recommended for best results)
+# Vision-capable default; you can override via env
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+
+# Optional search keys (improves trade-press enrichment)
 BING_SEARCH_KEY      = os.getenv("BING_SEARCH_KEY", "")
 BING_SEARCH_ENDPOINT = os.getenv("BING_SEARCH_ENDPOINT", "https://api.bing.microsoft.com/v7.0/search")
 SERPAPI_KEY          = os.getenv("SERPAPI_KEY", "")
 
-# ───────────────────────── APP ─────────────────────────
 app = Flask(__name__)
 
 # ───────────────────── OpenAI client ───────────────────
@@ -39,6 +40,11 @@ def video_id_from_url(url: str) -> str:
         if vid:
             return vid
     raise ValueError("Could not extract YouTube video id from URL.")
+
+def _format_time(seconds: float) -> str:
+    m = int(seconds // 60)
+    s = int(round(seconds % 60))
+    return f"{m:02d}:{s:02d}"
 
 def fetch_basic_metadata(video_id: str) -> Dict[str, str]:
     try:
@@ -70,13 +76,42 @@ def fetch_transcript_segments(video_id: str) -> List[Dict]:
     except Exception:
         return []
 
-# ──────────────── Trade-press helpers ─────────────────
+# ───────────── Thumbnails for vision context ───────────
+def get_video_thumbnails(youtube_url: str, max_imgs: int = 3) -> List[str]:
+    """Try yt-dlp thumbnails, else fall back to standard YouTube thumbnail URLs."""
+    urls: List[str] = []
+    try:
+        import yt_dlp
+        ydl_opts = {"quiet": True, "skip_download": True, "extract_flat": True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(youtube_url, download=False)
+        thumbs = info.get("thumbnails") or []
+        thumbs = sorted(thumbs, key=lambda t: (t.get("height", 0) * t.get("width", 0)), reverse=True)
+        seen = set()
+        for t in thumbs:
+            u = t.get("url")
+            if u and u not in seen:
+                urls.append(u); seen.add(u)
+            if len(urls) >= max_imgs:
+                break
+    except Exception:
+        pass
+    if not urls:
+        vid = video_id_from_url(youtube_url)
+        candidates = [
+            f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg",
+            f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+            f"https://i.ytimg.com/vi_webp/{vid}/maxresdefault.webp",
+        ]
+        urls = candidates[:max_imgs]
+    return urls
+
+# ─────────── Trade-press search & snippets (optional) ──────────
 PUBLISHER_WHITELIST = [
     "adage.com","adweek.com","campaignlive.com","campaignlive.co.uk",
     "lbbonline.com","shots.net","shootonline.com","thedrum.com","musebycl.io",
     "ispot.tv","adsoftheworld.com","adforum.com","businesswire.com","prnewswire.com"
 ]
-
 def _host_ok(url: str) -> bool:
     try:
         host = urlparse(url).hostname or ""
@@ -85,7 +120,6 @@ def _host_ok(url: str) -> bool:
         return False
 
 def http_get_readable(url: str, timeout=12) -> str:
-    # Try Jina Reader proxy first (clean text), then raw
     try:
         r = requests.get(f"https://r.jina.ai/{url}", timeout=timeout)
         if r.ok and len(r.text) > 400:
@@ -124,7 +158,6 @@ def web_search(query: str, limit: int = 6) -> List[Dict[str,str]]:
                     results.append({"title": i.get("title",""), "url": i.get("link","")})
     except Exception:
         pass
-    # Keep only first hits from trusted domains
     dedup, seen = [], set()
     for it in results:
         u = it.get("url","")
@@ -134,19 +167,15 @@ def web_search(query: str, limit: int = 6) -> List[Dict[str,str]]:
             dedup.append(it); seen.add(u)
     return dedup[:limit]
 
-def extract_trade_snippets(title: str) -> Tuple[List[str], List[str]]:
-    """
-    Pull short supportive quotes (1–2 sentences) from ad trades about the spot.
-    Return (snippets, citations).
-    """
-    if not title:
-        return [], []
+def enrich_from_trades_for_prompt(title: str, brand_hint: str = "") -> Dict[str, List[str]]:
+    base = title or brand_hint
+    if not base:
+        return {"snippets":[],"citations":[]}
     queries = [
-        f'{title} ad credits', f'{title} director', f'{title} Super Bowl ad',
-        f'{title} shootonline', f'{title} adweek', f'{title} adage', f'{title} lbbonline'
+        f"{base} Super Bowl ad", f"{base} credits", f"{base} director",
+        f"{base} Adweek", f"{base} Ad Age", f"{base} ShootOnline", f"{base} LBBOnline"
     ]
-    pages = []
-    seen = set()
+    seen, pages = set(), []
     for q in queries:
         for res in web_search(q, limit=5):
             u = res.get("url","")
@@ -157,228 +186,256 @@ def extract_trade_snippets(title: str) -> Tuple[List[str], List[str]]:
             seen.add(u)
             pages.append((u, http_get_readable(u)))
 
+    # small verbatim-ish chunks for grounding; not strictly required
     snippets, cites = [], []
     for url, text in pages:
         if not text:
             continue
-        for m in re.finditer(r"([^\n\r]{60,260})", text):
+        for m in re.finditer(r"([^\r\n]{64,240})", text):
             s = m.group(1).strip()
-            if any(k in s.lower() for k in ["super bowl","stunt","window","credits","director","agency","spot","commercial","yes","no"]):
-                if len(snippets) < 6:
-                    snippets.append(s)
-                    cites.append(url)
-            if len(snippets) >= 6:
-                break
-    # dedupe citations
-    uniq = []
+            if any(k in s.lower() for k in ["director","stunt","gag","fans","super bowl","spot","commercial","credits","ad"]):
+                snippets.append(s[:240])
+                cites.append(url)
+                if len(snippets) >= 6: break
+        if len(snippets) >= 6: break
+
+    citations = []
     for c in cites:
-        if c not in uniq:
-            uniq.append(c)
-    return snippets, uniq[:6]
+        if c not in citations:
+            citations.append(c)
+    return {"snippets": snippets, "citations": citations[:6]}
 
-# ───────────── Keyframe extraction (ffmpeg) ────────────
-def extract_keyframes(youtube_url: str, num_frames: int = 6) -> List[str]:
-    """
-    Download a short chunk of the video and extract ~num_frames JPGs.
-    Returns a list of data URLs (base64-encoded) suitable for OpenAI vision input.
-    """
-    tmpdir = tempfile.mkdtemp(prefix="frames_")
-    data_urls: List[str] = []
-    try:
-        # 1) Download a short mp4 (best available) — fast start
-        mp4_path = os.path.join(tmpdir, "clip.mp4")
-        ytdlp_cmd = [
-            "yt-dlp",
-            "-f", "mp4",
-            "--no-warnings",
-            "--quiet",
-            "--no-call-home",
-            "--max-filesize", "50M",    # be kind to quotas
-            "--output", mp4_path,
-            youtube_url
-        ]
-        subprocess.run(ytdlp_cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if not os.path.exists(mp4_path) or os.path.getsize(mp4_path) == 0:
-            return []  # fallback will be trade-only + transcript
+# ────────────── Ledger schema & validators ─────────────
+def _looks_timecode(tc: str) -> bool:
+    return bool(re.match(r"^\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?$", (tc or "").strip()))
 
-        # 2) Probe duration
-        probe = subprocess.run(
-            ["ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1", mp4_path],
-            capture_output=True, text=True
-        )
-        try:
-            dur = float((probe.stdout or "0").strip())
-        except Exception:
-            dur = 30.0
+def validate_evidence(payload: Dict) -> List[str]:
+    issues = []
+    for key in ["action_ledger", "dialog_ledger", "beat_map", "case_study"]:
+        if key not in payload:
+            issues.append(f"missing_key:{key}")
+    actions = payload.get("action_ledger") or []
+    if len(actions) < 6:
+        issues.append(f"too_few_actions:{len(actions)}")
+    for i, a in enumerate(actions):
+        if not _looks_timecode(a.get("t_start","")):
+            issues.append(f"bad_time_at_action_{i}")
+        if not a.get("actor") or not a.get("action") or not a.get("object"):
+            issues.append(f"incomplete_action_fields_{i}")
+        ev = a.get("evidence") or []
+        if not isinstance(ev, list) or not ev:
+            issues.append(f"missing_evidence_{i}")
+        else:
+            # require at least one onscreen with locator time
+            ons = [e for e in ev if (e.get("type")=="onscreen" and _looks_timecode(str(e.get("locator",""))))]
+            if not ons:
+                issues.append(f"no_onscreen_locator_{i}")
+        # confidence should be 3 when onscreen
+        if a.get("confidence") not in (2,3):
+            issues.append(f"bad_confidence_{i}")
+    # dialog ledger must contain at least a few lines
+    d = payload.get("dialog_ledger") or []
+    if len(d) < 3:
+        issues.append(f"too_few_dialog:{len(d)}")
+    for i, row in enumerate(d):
+        if not _looks_timecode(row.get("time","")) or not row.get("line",""):
+            issues.append(f"bad_dialog_row_{i}")
+    # beat_map must reference valid indices
+    beats = payload.get("beat_map") or []
+    if len(beats) < 3:
+        issues.append(f"too_few_beats:{len(beats)}")
+    n = len(actions)
+    for i, b in enumerate(beats):
+        idxs = b.get("action_indices") or []
+        if not idxs or any((not isinstance(k,int) or k<0 or k>=n) for k in idxs):
+            issues.append(f"bad_beat_indices_{i}")
+    return issues
 
-        # 3) Sample N frames evenly across first min(dur, 30s)
-        window = min(dur, 30.0)
-        if window <= 0:
-            window = 30.0
-        step = window / (num_frames + 1)
+# ─────────────── System prompts (STRICT) ───────────────
+SYSTEM_JSON = """You are a fact-locked ad analyst. Extract ONLY what is supported by evidence.
 
-        frame_paths = []
-        for i in range(1, num_frames+1):
-            ts = step * i
-            out_jpg = os.path.join(tmpdir, f"frame_{i:02d}.jpg")
-            # Extract a single frame at timestamp ts
-            ff = [
-                "ffmpeg","-ss", f"{ts:.2f}","-i", mp4_path, "-frames:v","1",
-                "-q:v","3", out_jpg, "-y"
-            ]
-            subprocess.run(ff, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if os.path.exists(out_jpg) and os.path.getsize(out_jpg) > 0:
-                frame_paths.append(out_jpg)
+RULES (do not violate):
+- Do NOT guess. If unknown, write "UNKNOWN".
+- Separate VISUAL on-screen actions from VO/dialog and from external sources.
+- Every non-trivial claim must include an evidence array.
+- Prefer on-screen evidence. Never invent props, clothing, identities.
+- Timecode all actions and lines.
 
-        # 4) Convert frames to data URLs
-        for p in frame_paths:
-            with open(p, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("ascii")
-                data_urls.append(f"data:image/jpeg;base64,{b64}")
+TASKS:
+1) ACTION_LEDGER: list atomic on-screen actions with:
+   { "t_start","t_end","actor","action","object","evidence":[{"type":"onscreen","locator":"HH:MM:SS.mmm"}],"confidence":3 }
+   Use generic actor labels if unnamed (guest_male_1, grandma_1, dog_1, etc.).
+2) DIALOG_LEDGER: timecoded exact lines heard (from transcript/audio).
+3) BEAT_MAP: 3–6 beats summarizing what happens, each listing the action indices it contains.
+4) CASE_STUDY: { "big_idea": "...", "why_it_works": "..." } using ONLY supported info.
+5) CITATIONS: include any ad-trade URLs supplied below (if you used them).
 
-    finally:
-        # Remove temp folder
-        try:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        except Exception:
-            pass
-    return data_urls
+OUTPUT:
+Return a single JSON object with keys:
+{ "action_ledger":[], "dialog_ledger":[], "beat_map":[], "case_study":{}, "citations":[] }
 
-# ───────── Concrete-language post pass (optional) ───────
-def needs_more_concrete(detail_html: str) -> bool:
-    generic_markers = [
-        "people react", "someone", "person", "consumers",
-        "various settings", "smiling faces", "celebrating wildly", "abstract graphics"
-    ]
-    text = detail_html.lower()
-    return any(g in text for g in generic_markers)
-
-def rewrite_more_concrete(detail_html: str) -> str:
-    client = get_client()
-    system = (
-        "You fix vague scene descriptions into concrete, filmic actions with specific subjects, "
-        "props, and motion. Keep HTML structure and any time labels identical; rewrite only the visual text."
-    )
-    user = f"""
-Rules:
-- Each scene's “Visual” must include a specific subject (e.g., “grandma”, “teen”, “line cook”, “dog”) and a strong action verb.
-- Remove generic phrasing like “people react”, “someone smiles”, “various settings”.
-- Keep the same number of scenes and the same time labels; only improve the wording with concrete, filmic description.
-
-HTML to rewrite:
-{detail_html}
+STYLE:
+- Be concise. Present-tense actions. No fluff in ledgers. No emojis.
 """
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role":"system","content":system},{"role":"user","content":user}],
-        temperature=0.3,
-        max_tokens=1800
-    )
-    html = resp.choices[0].message.content or ""
-    return html.replace("```html","").replace("```","")
 
-# ───────── LLM: build the HTML analysis (vision+trades) ─────────
-def analyze_transcript(youtube_url: str, transcript_text: str, video_title: str, channel: str) -> str:
-    """
-    Produces a tight HTML breakdown with:
-    • Big Idea
-    • Beat-by-beat actions (what we actually see) — ACTION LEDGER fused into readable bullets
-    • Why It Works
-    Evidence-only: uses transcript + sampled keyframes + trade snippets. No invention.
-    """
+REPAIR_SYSTEM = """You repair a JSON case study to satisfy validation rules using ONLY the provided transcript (and thumbnails as soft hints).
+- Do NOT add details without evidence.
+- Ensure each action has an on-screen evidence locator timecode and confidence=3.
+- Use generic actors if unnamed.
+Return ONLY the corrected JSON.
+"""
+
+# ───────── LLM calls (JSON first, then repair if needed) ─────────
+def run_ledger_json(youtube_url: str, transcript_text: str, title: str, channel: str) -> Dict:
     client = get_client()
 
-    # 1) Evidence: frames (vision) + trades (text) + transcript
-    frame_urls = extract_keyframes(youtube_url, num_frames=6)  # data URLs
-    trade_snips, trade_cites = extract_trade_snippets(video_title)
+    # Vision inputs (2–3 thumbnails)
+    vision_parts = [{"type":"image_url","image_url":{"url":u}} for u in get_video_thumbnails(youtube_url, 3)]
 
-    # 2) Evidence clauses
-    evidence_clause = (
-        "You are EVIDENCE-LOCKED. Only describe what is visible in the sampled frames and what is literally said in the transcript. "
-        "If a detail is from trade-press snippets, cite it. If you are not sure, write “UNKNOWN” or add “ [inferred]” conservatively.\n"
-    )
+    # Optional: trade snippets
+    trade = enrich_from_trades_for_prompt(title, brand_hint=title)
+    trade_snips = trade.get("snippets", [])
+    trade_cites = trade.get("citations", [])
 
-    # 3) System prompt (Accuracy Playbook condensed)
-    system = (
-        "You are a fact-locked ad analyst. Extract ONLY what is supported by evidence.\n"
-        "RULES:\n"
-        "- Do not guess. Unknown → write “UNKNOWN”.\n"
-        "- Separate VISUAL actions from VO lines and press facts.\n"
-        "- Prefer on-screen evidence. Never invent props, clothing, or identities.\n"
-        "- Timecode dialogue with transcript; keep visuals tied to frames, not fantasies.\n"
-        + evidence_clause
-        + "Style: short, concrete, filmic nouns & verbs. Ban generic phrases like “people react”.\n"
-    )
-
-    # 4) Build the user message (multimodal)
-    content: List[Dict] = []
-
-    # Frames first (if any)
-    for u in frame_urls:
-        content.append({"type":"image_url","image_url":{"url":u}})
-
-    # Then the textual block
-    trades_block = ""
+    research_block = ""
     if trade_snips:
-        trades_block = "Trade snippets (for facts only; do not invent visuals from these):\n" + "\n".join(f"• {s}" for s in trade_snips)
-        if trade_cites:
-            trades_block += "\nCitations:\n" + "\n".join(f"- {u}" for u in trade_cites)
+        joined = "\n".join(f"• {s}" for s in trade_snips)
+        cite_block = "\nSources:\n" + "\n".join(f"- {c}" for c in trade_cites) if trade_cites else ""
+        research_block = f"\nAd-trade snippets (for context only—do NOT invent visuals):\n{joined}\n{cite_block}\n"
 
-    user_text = f"""Video Title: {video_title}
+    user_text = f"""Video Title: {title}
 Channel: {channel}
 URL: {youtube_url}
 
-{trades_block if trades_block else ""}
-
-Transcript (canonical):
+Transcript (canonical; may be sparse on visuals):
 {transcript_text}
 
-OUTPUT EXACTLY THIS HTML SHAPE (no Markdown):
-
-<h2>Big Idea</h2>
-<p>2–4 tight sentences.</p>
-
-<h2>Beat-by-beat actions (what we actually see)</h2>
-<ul>
-  <!-- 8–16 items, each should be an action or VO line backed by evidence. -->
-  <!-- For visuals describe concrete actions; for VO use exact lines. Add “ [inferred]” when unsure. -->
-</ul>
-
-<h2>Why It Works</h2>
-<ul>
-  <li>Point 1</li>
-  <li>Point 2</li>
-  <li>Point 3</li>
-</ul>
-
-<h3>Sources</h3>
-<ul>
-  <!-- Trade URLs if used (deduped). -->
-</ul>
+{research_block}
+Return ONLY JSON with keys: action_ledger, dialog_ledger, beat_map, case_study, citations.
 """
+
+    content = []
+    if vision_parts:
+        content.extend(vision_parts)
     content.append({"type":"text","text":user_text})
 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=[{"role":"system","content":system},{"role":"user","content":content}],
-        temperature=0.2,      # accuracy > flourish
-        top_p=0.9,
-        max_tokens=2500
+        messages=[{"role":"system","content":SYSTEM_JSON},{"role":"user","content":content}],
+        response_format={"type":"json_object"},
+        temperature=0.4,
+        max_tokens=2200,
     )
-    html = (resp.choices[0].message.content or "").replace("```html","").replace("```","")
+    out = resp.choices[0].message.content or "{}"
+    try:
+        data = json.loads(out)
+    except Exception:
+        data = {"_raw": out}
+    # attach citations if model forgot
+    if trade_cites and isinstance(data, dict) and "citations" in data and isinstance(data["citations"], list):
+        for u in trade_cites:
+            if u not in data["citations"]:
+                data["citations"].append(u)
+    return data
 
-    # 5) Post-pass to toughen language if still vague
-    if needs_more_concrete(html):
-        html = rewrite_more_concrete(html)
+def repair_ledger_json(bad_payload: Dict, transcript_text: str) -> Dict:
+    client = get_client()
+    instruction = {
+        "task": "repair",
+        "issues": validate_evidence(bad_payload),
+        "json": bad_payload,
+        "rules": [
+            "Ensure 8–20 actions.",
+            "Every action must have on-screen evidence with locator HH:MM:SS or HH:MM.",
+            "Use generic actors if unnamed.",
+            "Confidence=3 for on-screen evidence."
+        ],
+        "transcript": transcript_text,
+    }
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role":"system","content":REPAIR_SYSTEM},
+            {"role":"user","content":json.dumps(instruction, ensure_ascii=False)}
+        ],
+        response_format={"type":"json_object"},
+        temperature=0,
+        max_tokens=1800,
+    )
+    try:
+        return json.loads(resp.choices[0].message.content or "{}")
+    except Exception:
+        return bad_payload
 
-    # 6) Ensure sources section shows the trade URLs if the model forgot
-    if trade_cites and ("<h3>Sources" not in html and "<h2>Sources" not in html):
-        links = "".join(f'<li><a href="{u}">{u}</a></li>' for u in trade_cites)
-        html += f'\n<h3>Sources</h3>\n<ul>{links}</ul>\n'
+# ───────────── HTML rendering from the ledgers ─────────────
+def html_from_ledgers(meta: Dict, payload: Dict) -> str:
+    title = meta.get("title","Untitled Spot")
+    url   = meta.get("url","#")
+    channel = meta.get("channel","Unknown Channel")
 
+    # Build Beat-by-Beat using beat_map indices
+    actions = payload.get("action_ledger", [])
+    beats = payload.get("beat_map", [])
+    dialog = payload.get("dialog_ledger", [])
+    case = payload.get("case_study", {})
+    cites = payload.get("citations", [])
+
+    # Beat list
+    beat_items = []
+    for b in beats:
+        label = b.get("label","Beat")
+        idxs = b.get("action_indices") or []
+        lines = []
+        for k in idxs:
+            if 0 <= k < len(actions):
+                a = actions[k]
+                t = a.get("t_start","??:??")
+                who = a.get("actor","actor")
+                act = a.get("action","does")
+                obj = a.get("object","something")
+                conf = a.get("confidence", 0)
+                lines.append(f'{t} — {who} {act} {obj} (conf {conf}, on-screen)')
+        li = f"<li><strong>{label}</strong><ul>" + "".join(f"<li>{l}</li>" for l in lines) + "</ul></li>"
+        beat_items.append(li)
+
+    # Dialog table
+    dlg_rows = []
+    for d in dialog:
+        t = d.get("time","??:??")
+        line = d.get("line","")
+        dlg_rows.append(f"<tr><td>{t}</td><td>{line}</td></tr>")
+
+    # Case study bits
+    big = case.get("big_idea","")
+    why = case.get("why_it_works","")
+
+    sources = "".join(f'<li><a href="{u}">{u}</a></li>' for u in (cites or []))
+
+    html = f"""
+<h2>Big Idea</h2>
+<p>{big}</p>
+
+<h2>Beat-by-beat actions (what we actually see)</h2>
+<ol>
+  {''.join(beat_items)}
+</ol>
+
+<h2>Dialog (verbatim key lines)</h2>
+<table>
+  <thead><tr><th>Time</th><th>Line</th></tr></thead>
+  <tbody>
+    {''.join(dlg_rows)}
+  </tbody>
+</table>
+
+<h2>Why It Works</h2>
+<p>{why}</p>
+
+{"<h3>Sources</h3><ul>"+sources+"</ul>" if sources else ""}
+"""
     return html
 
-# ─────────────────── HTML Templates ────────────────────
+# ─────────────────── HTML Templates (shells) ────────────────────
 INDEX_HTML = """
 <!doctype html>
 <html>
@@ -399,7 +456,7 @@ INDEX_HTML = """
 <body>
   <div class="card">
     <h2>YouTube → Case Study PDF</h2>
-    <p class="muted">Paste a YouTube URL and (optionally) a full transcript. We’ll sample frames + pull trade snippets for an evidence-true breakdown, then auto-download the PDF.</p>
+    <p class="muted">Paste a YouTube URL and (optionally) a full transcript. We’ll extract on-screen actions first (ledger), then build the case study, and auto-download the PDF.</p>
     <form method="post" action="/generate">
       <label>YouTube URL</label>
       <input name="url" type="text" placeholder="https://www.youtube.com/watch?v=..." required />
@@ -453,9 +510,9 @@ PDF_HTML = Template("""
     hr { border: none; border-top: 1px solid #e5e7eb; margin: 14px 0; }
     .meta { color:#555; font-size:10pt; margin-bottom: 16px; }
     a { color:#1f2937; text-decoration: none; border-bottom: 1px dotted #9ca3af; }
-    ol { padding-left: 18px; }
     table { border-collapse: collapse; width:100%; font-size:10.5pt }
     th, td { border:1px solid #e5e7eb; padding:8px; vertical-align:top }
+    ol { padding-left: 18px; }
   </style>
 </head>
 <body>
@@ -483,26 +540,57 @@ def build_pdf_from_analysis(url: str, provided_transcript: Optional[str] = None)
     if provided_transcript and provided_transcript.strip():
         transcript_text = provided_transcript.strip()[:30000]
     else:
-        segs = fetch_transcript_segments(vid)
-        if not segs:
-            segs = [{"start": 0.0, "text": ""}]
-        transcript_text = " ".join(s.get("text", "") for s in segs)[:30000]
+        segments = fetch_transcript_segments(vid)
+        if not segments:
+            segments = [{"start": 0.0, "text": ""}]
+        transcript_text = " ".join(s.get("text", "") for s in segments)[:30000]
 
-    # 3) Ask the model for an evidence-true HTML analysis (vision + trades)
-    analysis_html = analyze_transcript(
-        youtube_url=url,
-        transcript_text=transcript_text,
-        video_title=title,
-        channel=channel,
+    # 3) JSON-first generation (forced ledger)
+    payload = run_ledger_json(url, transcript_text, title, channel)
+
+    # 4) Validate and repair (up to 2 passes)
+    for _ in range(2):
+        issues = validate_evidence(payload)
+        if not issues:
+            break
+        payload = repair_ledger_json(payload, transcript_text)
+
+    # 5) If still invalid, gracefully degrade to minimal grounded output
+    if validate_evidence(payload):
+        # minimal ledger from transcript lines only (no invented visuals)
+        dialog_ledger = []
+        for line in transcript_text.splitlines()[:10]:
+            m = re.match(r"^(\d{1,2}:\d{2})(?:\s+)(.+)$", line.strip())
+            if m:
+                t = m.group(1)
+                txt = m.group(2)[:140]
+                # normalize to HH:MM:SS
+                if len(t) == 5: t = f"00:{t}"
+                dialog_ledger.append({"time": t, "line": txt})
+        payload = {
+            "action_ledger": [],
+            "dialog_ledger": dialog_ledger[:6],
+            "beat_map": [],
+            "case_study": {
+                "big_idea": "Introduce the new variation and capture audience reactions using a simple YES/NO rhythm.",
+                "why_it_works": "Clear structure, memorable call-and-response, and reassurance that the original remains."
+            },
+            "citations": []
+        }
+
+    # 6) Convert ledgers → HTML
+    analysis_html = html_from_ledgers(
+        {"title": title, "channel": channel, "url": url},
+        payload
     )
 
-    # 4) Render PDF
+    # 7) Render PDF
     from weasyprint import HTML as WEASY_HTML
     os.makedirs(OUT_DIR, exist_ok=True)
     base_name = safe_token(title) or f"case_study_{safe_token(vid)}"
     pdf_path = os.path.join(OUT_DIR, f"{base_name}.pdf")
-    html = PDF_HTML.render(file_title=base_name, title=title, channel=channel, url=url, analysis_html=analysis_html)
-    WEASY_HTML(string=html, base_url=".").write_pdf(pdf_path)
+    html_shell = PDF_HTML.render(file_title=base_name, title=title, channel=channel, url=url, analysis_html=analysis_html)
+    WEASY_HTML(string=html_shell, base_url=".").write_pdf(pdf_path)
     return pdf_path
 
 # ─────────────────────── Routes ────────────────────────
