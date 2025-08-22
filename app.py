@@ -1,6 +1,6 @@
-import os, re, json, datetime
+import os, re, json, html
 from urllib.parse import urlparse, parse_qs
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from flask import Flask, request, render_template_string, send_from_directory, abort
 from jinja2 import Template
@@ -12,21 +12,16 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # vision-capable
 OUT_DIR = os.getenv("OUT_DIR", "out")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# Optional search keys (to pull small trade-press snippets)
+# Optional: search keys (recommended for best results)
 BING_SEARCH_KEY      = os.getenv("BING_SEARCH_KEY", "")
 BING_SEARCH_ENDPOINT = os.getenv("BING_SEARCH_ENDPOINT", "https://api.bing.microsoft.com/v7.0/search")
-SERPAPI_KEY          = os.getenv("SERPAPI_KEY", "")
+SERPAPI_KEY          = os.getenv("SERPAPI_KEY", "")  # if you prefer SerpAPI instead of Bing
 
-# Debranding map — extend as needed
-DEBRAND_RULES = [
-    {"from": r"(?i)\bReese['’]s\b", "to": "candy"},
-    {"from": r"(?i)\bReese['’]s Peanut Butter Cups\b", "to": "candy Peanut Butter Cups"},
-]
-
-# ───────────────────── App & OpenAI ───────────────────
 app = Flask(__name__)
+
+# ───────────────────── OpenAI client ───────────────────
 from openai import OpenAI
-def get_client():
+def _llm_client():
     return OpenAI()  # uses OPENAI_API_KEY
 
 # ────────────────────── Utilities ──────────────────────
@@ -40,7 +35,8 @@ def video_id_from_url(url: str) -> str:
         return q.path.lstrip("/")
     if q.hostname and "youtube.com" in q.hostname:
         vid = parse_qs(q.query).get("v", [None])[0]
-        if vid: return vid
+        if vid:
+            return vid
     raise ValueError("Could not extract YouTube video id from URL.")
 
 def fetch_basic_metadata(video_id: str) -> Dict[str, str]:
@@ -57,20 +53,25 @@ def fetch_basic_metadata(video_id: str) -> Dict[str, str]:
         pass
     return {"title": "", "author": ""}
 
-def fetch_transcript_text(video_id: str) -> str:
+def fetch_transcript_segments(video_id: str) -> List[Dict]:
+    """Return list of segments with start times and text; empty list if missing."""
     try:
         trs = YouTubeTranscriptApi.list_transcripts(video_id)
         try:
-            t = trs.find_transcript(["en","en-US"]).fetch()
+            t = trs.find_transcript(["en", "en-US"]).fetch()
         except Exception:
             t = YouTubeTranscriptApi.get_transcript(video_id)
-        txt = " ".join((seg.get("text") or "").strip() for seg in t if (seg.get("text") or "").strip())
-        return txt[:32000]
+        return [
+            {"start": float(seg.get("start", 0.0)), "text": seg.get("text", "")}
+            for seg in t
+            if seg.get("text", "").strip()
+        ]
     except Exception:
-        return ""
+        return []
 
-def get_video_thumbnails(youtube_url: str, max_imgs: int = 3) -> List[str]:
-    """Try yt-dlp, else fall back to static thumbnail URLs."""
+# ───────────── Thumbnails for vision context ───────────
+def get_video_thumbnails(youtube_url: str, max_imgs: int = 4) -> List[str]:
+    """Try yt-dlp thumbnails, else fall back to standard YouTube thumbnail URLs."""
     urls: List[str] = []
     try:
         import yt_dlp
@@ -78,29 +79,32 @@ def get_video_thumbnails(youtube_url: str, max_imgs: int = 3) -> List[str]:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(youtube_url, download=False)
         thumbs = info.get("thumbnails") or []
-        thumbs = sorted(thumbs, key=lambda t: (t.get("height",0)*t.get("width",0)), reverse=True)
+        thumbs = sorted(thumbs, key=lambda t: (t.get("height", 0) * t.get("width", 0)), reverse=True)
         seen = set()
         for t in thumbs:
             u = t.get("url")
             if u and u not in seen:
                 urls.append(u); seen.add(u)
-            if len(urls) >= max_imgs: break
+            if len(urls) >= max_imgs:
+                break
     except Exception:
         pass
+    # Fallback patterns if none found
     if not urls:
         vid = video_id_from_url(youtube_url)
-        urls = [
+        candidates = [
             f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg",
             f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
             f"https://i.ytimg.com/vi_webp/{vid}/maxresdefault.webp",
-        ][:max_imgs]
+        ]
+        urls = candidates[:max_imgs]
     return urls
 
-# ─────────── Trade-press search (optional) ────────────
+# ─────────── Trade-press search & snippets ─────────────
 PUBLISHER_WHITELIST = [
-    "adage.com","adweek.com","campaignlive.com","campaignlive.co.uk","lbbonline.com",
-    "shots.net","shootonline.com","thedrum.com","musebycl.io","ispot.tv",
-    "adsoftheworld.com","adforum.com","businesswire.com","prnewswire.com"
+    "adage.com","adweek.com","campaignlive.com","campaignlive.co.uk",
+    "lbbonline.com","shots.net","shootonline.com","thedrum.com","musebycl.io",
+    "ispot.tv","adsoftheworld.com","adforum.com","businesswire.com","prnewswire.com"
 ]
 
 def _host_ok(url: str) -> bool:
@@ -110,20 +114,23 @@ def _host_ok(url: str) -> bool:
     except Exception:
         return False
 
-def http_get_readable(url: str, timeout=10) -> str:
+def http_get_readable(url: str, timeout=12) -> str:
+    # Try Jina Reader proxy first (clean text), then raw
     try:
         r = requests.get(f"https://r.jina.ai/{url}", timeout=timeout)
-        if r.ok and len(r.text) > 400: return r.text
+        if r.ok and len(r.text) > 400:
+            return r.text
     except Exception:
         pass
     try:
         r = requests.get(url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"})
-        if r.ok: return r.text
+        if r.ok:
+            return r.text
     except Exception:
         pass
     return ""
 
-def web_search(query: str, limit: int = 5) -> List[Dict[str,str]]:
+def web_search(query: str, limit: int = 6) -> List[Dict[str,str]]:
     results = []
     try:
         if BING_SEARCH_KEY:
@@ -147,54 +154,87 @@ def web_search(query: str, limit: int = 5) -> List[Dict[str,str]]:
                     results.append({"title": i.get("title",""), "url": i.get("link","")})
     except Exception:
         pass
-    # prefer whitelist
+    # Keep only first hits from trusted domains
     dedup, seen = [], set()
     for it in results:
         u = it.get("url","")
-        if not u or u in seen: continue
+        if not u or u in seen:
+            continue
         if _host_ok(u):
             dedup.append(it); seen.add(u)
     return dedup[:limit]
 
-def gather_trade_snippets(title: str) -> Dict[str, List[str]]:
-    if not title: return {"snippets":[], "citations":[]}
+CREDIT_PATTERNS = {
+    "voiceover": r"(?:Voice[- ]?over|VO|Narration|Narrator)\s*[:\-]\s*([^\n\r;|,]+)",
+    "director" : r"(?:Director|Directed by)\s*[:\-]\s*([^\n\r;|,]+)",
+    "agency"   : r"(?:Agency|Creative Agency)\s*[:\-]\s*([^\n\r;|,]+)",
+}
+
+def _extract_lines(text: str, max_chars=260):
+    # Take 1–2 sentence chunks around interesting words
+    chunks = []
+    for m in re.finditer(r"([^\r\n]{60,260})", text):
+        s = m.group(1).strip()
+        if any(k in s.lower() for k in ["director","agency","voice","vo","super bowl","spot","commercial","credits","cast","crew"]):
+            chunks.append(s[:max_chars])
+        if len(chunks) >= 6:
+            break
+    return chunks
+
+def enrich_from_trades_for_prompt(title: str, brand_hint: str = "") -> Dict[str, List[str]]:
+    """
+    Returns small verbatim snippets + any credits we can spot, from trusted trades.
+    { "snippets":[...], "citations":[...], "credits":{"voiceover":[],"director":[],"agency":[]} }
+    """
+    base = title or brand_hint
+    if not base:
+        return {"snippets":[],"citations":[],"credits":{"voiceover":[],"director":[],"agency":[]}}
     queries = [
-        f"{title} Super Bowl ad credits",
-        f"{title} director credits",
-        f"{title} ad breakdown",
-        f"{title} site:adage.com",
-        f"{title} site:adweek.com",
-        f"{title} site:shootonline.com",
+        f"{base} credits", f"{base} director", f"{base} VO", f"{base} voiceover",
+        f"{base} Super Bowl ad", f"{base} ad breakdown", f"{base} shootonline",
+        f"{base} adage", f"{base} adweek", f"{base} lbbonline", f"{base} shots"
     ]
-    pages, cites = [], []
+    seen, pages = set(), []
     for q in queries:
-        for r in web_search(q, limit=4):
-            u = r.get("url","")
-            if not u or not _host_ok(u): continue
-            txt = http_get_readable(u)
-            if not txt: continue
-            pages.append((u, txt))
-            cites.append(u)
-    # Pull a handful of 1–2 sentence snippets
-    snips = []
-    for (_, txt) in pages:
-        for m in re.finditer(r"([^\n\r]{80,240})", txt):
-            s = m.group(1).strip()
-            if any(k in s.lower() for k in ["director","agency","stunt","gag","montage","spot","super bowl","credits"]):
-                snips.append(s[:240])
-                if len(snips) >= 6: break
-        if len(snips) >= 6: break
-    # dedupe citations
-    dedup_cites = []
+        for res in web_search(q, limit=5):
+            u = res.get("url","")
+            if not u or u in seen: 
+                continue
+            if not _host_ok(u):
+                continue
+            seen.add(u)
+            pages.append((u, http_get_readable(u)))
+
+    snippets, cites = [], []
+    credit_bag = {"voiceover":{}, "director":{}, "agency":{}}
+    for url, text in pages:
+        if not text:
+            continue
+        # collect small verbatim chunks
+        for sn in _extract_lines(text):
+            if len(snippets) < 6:
+                snippets.append(sn)
+                cites.append(url)
+        # try simple credit regex
+        for key, pat in CREDIT_PATTERNS.items():
+            for hit in re.findall(pat, text, flags=re.IGNORECASE):
+                name = hit.strip()
+                if name:
+                    credit_bag[key].setdefault(name, []).append(url)
+
+    def top_keys(d: Dict[str, List[str]]) -> List[str]:
+        if not d: return []
+        return [k for k,_ in sorted(d.items(), key=lambda kv: len(kv[1]), reverse=True)][:2]
+
+    credits = {k: top_keys(v) for k,v in credit_bag.items()}
+    # dedupe & trim citations in same order as snippets
+    citations = []
     for c in cites:
-        if c not in dedup_cites: dedup_cites.append(c)
-    return {"snippets": snips, "citations": dedup_cites[:8]}
+        if c not in citations:
+            citations.append(c)
+    return {"snippets": snippets, "citations": citations[:6], "credits": credits}
 
-# ───────────────────── LLM JSON GEN (with montage visuals) ─────────────────────
-from openai import OpenAI
-def _llm_client():
-    return OpenAI()  # uses OPENAI_API_KEY
-
+# ───────── LLM: JSON with visuals_montage_sourced (strict) ─────────
 SOURCE_PRIORITY_PROMPT = """
 You are a fact-locked ad analyst. Output ONLY JSON.
 
@@ -279,7 +319,7 @@ def _vision_user_payload(youtube_url: str, video_title: str, channel: str,
 def _gpt_json(system_prompt: str, user_payload: List[dict]) -> dict:
     client = _llm_client()
     resp = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+        model=os.getenv("OPENAI_MODEL", OPENAI_MODEL),
         response_format={"type": "json_object"},
         messages=[
             {"role":"system","content": system_prompt},
@@ -292,7 +332,6 @@ def _gpt_json(system_prompt: str, user_payload: List[dict]) -> dict:
     try:
         return json.loads(txt)
     except Exception:
-        # permissive fallback
         start = txt.find("{"); end = txt.rfind("}")
         return json.loads(txt[start:end+1]) if start != -1 and end != -1 else {}
 
@@ -342,7 +381,15 @@ def build_debranded_json(youtube_url: str, provided_transcript: Optional[str]) -
     data.setdefault("beat_map", [])
     data.setdefault("dialogs", [])
     data.setdefault("visuals_montage_sourced", [])
-    data.setdefault("sources", research_urls[:8])
+    # attach any gathered sources (if model omitted)
+    if "sources" not in data or not isinstance(data.get("sources"), list):
+        data["sources"] = research_urls[:8]
+    elif research_urls:
+        # de-dupe merge
+        sset = set(data["sources"])
+        for u in research_urls[:8]:
+            if u not in sset:
+                data["sources"].append(u); sset.add(u)
 
     # Enforce montage items to be strictly source_verified_visuals or drop them
     clean_montage = []
@@ -371,121 +418,160 @@ INDEX_HTML = """
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>YouTube → De-Branded JSON</title>
+  <title>YouTube → JSON Case Study</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color:#111; margin: 24px; }
     .card { max-width: 860px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 14px; padding: 20px; box-shadow: 0 6px 20px rgba(0,0,0,.05); }
     label { display:block; margin: 10px 0 6px; font-weight: 600; }
-    input[type=text], textarea { width:100%; padding:10px 12px; border:1px solid #d1d5db; border-radius:10px; font-size:15px; }
+    input[type=text], textarea, select { width:100%; padding:10px 12px; border:1px solid #d1d5db; border-radius:10px; font-size:15px; }
     textarea { min-height: 140px; }
+    .row { display:flex; gap:12px; align-items:center; }
+    .row > div { flex:1; }
     .btn { background:#111827; color:#fff; border:none; padding: 10px 14px; border-radius: 10px; cursor:pointer; }
-    pre { background:#0b1020; color:#d1e7ff; padding:12px; border-radius:10px; overflow:auto; max-height:380px; }
+    .muted { color:#6b7280; font-size: 13px; }
   </style>
 </head>
 <body>
   <div class="card">
-    <h2>YouTube → De-Branded Case Study (JSON)</h2>
-    <p>Paste a YouTube URL and optionally a transcript. We’ll return strict JSON for your case study, de-branded to generic names.</p>
-    <form method="post" action="/generate_json">
+    <h2>YouTube → JSON Case Study</h2>
+    <p class="muted">Paste a YouTube URL and (optionally) a full transcript. Choose your download format: raw <code>.txt</code> (JSON) or a <code>.pdf</code> that embeds the JSON.</p>
+    <form method="post" action="/generate">
       <label>YouTube URL</label>
       <input name="url" type="text" placeholder="https://www.youtube.com/watch?v=..." required />
       <label style="margin-top:12px">Transcript (optional — paste if you already have it)</label>
-      <textarea name="transcript" placeholder="If empty, we’ll try to fetch captions automatically."></textarea>
-      <p style="margin-top:14px"><button class="btn" type="submit">Generate JSON</button></p>
+      <textarea name="transcript" placeholder="Paste full transcript here. If empty, we’ll try to fetch captions automatically."></textarea>
+      <div class="row" style="margin-top:12px">
+        <div>
+          <label>Download format</label>
+          <select name="format">
+            <option value="txt" selected>.txt (raw JSON)</option>
+            <option value="pdf">.pdf (JSON pretty-printed)</option>
+          </select>
+        </div>
+      </div>
+      <p style="margin-top:14px"><button class="btn" type="submit">Generate</button></p>
     </form>
   </div>
 </body>
 </html>
 """
 
-RESULT_HTML = """
+SUCCESS_HTML = """
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>JSON Ready</title>
+  <title>Generation Successful</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color:#111; margin: 24px; }
-    .card { max-width: 980px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 14px; padding: 20px; box-shadow: 0 6px 20px rgba(0,0,0,.05); }
-    .btn { background:#111827; color:#fff; border:none; padding: 10px 14px; border-radius: 10px; cursor:pointer; text-decoration:none; }
-    pre { background:#0b1020; color:#d1e7ff; padding:12px; border-radius:10px; overflow:auto; max-height:520px; }
+    .card { max-width: 860px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 14px; padding: 20px; box-shadow: 0 6px 20px rgba(0,0,0,.05); text-align: center; }
+    .btn { background:#111827; color:#fff; border:none; padding: 10px 14px; border-radius: 10px; cursor:pointer; text-decoration: none; }
+    .muted { color:#6b7280; font-size: 13px; }
+    code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
   </style>
 </head>
 <body>
   <div class="card">
-    <h2>De-Branded JSON generated</h2>
-    <p><a class="btn" href="{{ json_url }}" download>Download JSON: {{ json_filename }}</a></p>
-    <pre>{{ json_preview }}</pre>
-    <p style="margin-top:16px"><a href="/">Generate another</a></p>
+    <h2>Success!</h2>
+    <p>Your file should auto-download. If not, click the button below.</p>
+    <p><a href="{{ file_url }}" class="btn" download>Download: <code>{{ file_name }}</code></a></p>
+    <p style="margin-top:20px"><a href="/">Generate another</a></p>
   </div>
-  <script>(function(){const a=document.createElement('a');a.href="{{ json_url }}";a.download="{{ json_filename }}";document.body.appendChild(a);a.click();a.remove();})();</script>
+  <script>
+    (function(){ const a = document.createElement('a'); a.href = "{{ file_url }}"; a.download = "{{ file_name }}"; document.body.appendChild(a); a.click(); a.remove(); })();
+  </script>
 </body>
 </html>
 """
+
+PDF_WRAPPER = Template("""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>{{ title }}</title>
+  <style>
+    body { font: 12pt/1.55 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color:#111; margin: 28px; }
+    h1 { font-size: 18pt; margin: 0 0 12px; }
+    pre { padding: 14px; border: 1px solid #e5e7eb; border-radius: 10px; background: #f9fafb; white-space: pre-wrap; word-wrap: break-word; }
+    .meta { color:#555; font-size:10pt; margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+  <h1>{{ heading }}</h1>
+  <div class="meta">{{ url }}</div>
+  <pre>{{ json_text }}</pre>
+</body>
+</html>
+""")
+
+# ─────────────────── Builder + writers ──────────────────
+def build_and_write_json_file(url: str, provided_transcript: Optional[str], fmt: str) -> Tuple[str, str]:
+    """
+    Build JSON and write either .txt (raw JSON) or .pdf (pretty JSON wrapped).
+    Returns (abs_path, file_name).
+    """
+    data = build_debranded_json(url, provided_transcript)
+    file_id = data.get("id") or safe_token("case_study")
+    pretty = json.dumps(data, ensure_ascii=False, indent=2)
+
+    if fmt == "pdf":
+        from weasyprint import HTML as WEASY_HTML
+        html_doc = PDF_WRAPPER.render(
+            title=file_id,
+            heading=data.get("meta", {}).get("title", file_id),
+            url=data.get("meta", {}).get("url", url),
+            json_text=html.escape(pretty),
+        )
+        pdf_path = os.path.join(OUT_DIR, f"{file_id}.pdf")
+        WEASY_HTML(string=html_doc, base_url=".").write_pdf(pdf_path)
+        return pdf_path, f"{file_id}.pdf"
+
+    # default: txt
+    txt_path = os.path.join(OUT_DIR, f"{file_id}.txt")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(pretty)
+    return txt_path, f"{file_id}.txt"
+
 # ─────────────────────── Routes ────────────────────────
 @app.get("/health")
 def health():
     return "ok", 200
 
-# Update the form to post to /generate (see INDEX_HTML in your file if needed)
 @app.get("/")
 def index():
-    return render_template_string(INDEX_HTML.replace('action="/generate_json"', 'action="/generate"'))
-
-def _handle_generate_json():
-    url = request.form.get("url","").strip()
-    transcript_text = (request.form.get("transcript") or "").strip()
-    data = build_debranded_json(url, transcript_text or None)
-    base = data.get("id") or safe_token("case_study")
-    fname = f"{base}.json"
-    fpath = os.path.join(OUT_DIR, fname)
-    with open(fpath, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    return render_template_string(
-        RESULT_HTML,
-        json_url=f"/out/{fname}",
-        json_filename=fname,
-        json_preview=json.dumps(data, ensure_ascii=False, indent=2)[:100000]
-    )
-
-# Accept BOTH endpoints so old links/buttons still work
-@app.post("/generate")
-def generate_route():
-    try:
-        return _handle_generate_json()
-    except Exception as e:
-        try:
-            with open(os.path.join(OUT_DIR, "last_error.txt"), "w", encoding="utf-8") as f:
-                f.write(str(e))
-        except Exception:
-            pass
-        return f"<pre>Error generating JSON:\n{e}\nCheck /out/last_error.txt for details.</pre>", 400
-
-@app.post("/generate_json")
-def generate_json_route():
-    try:
-        return _handle_generate_json()
-    except Exception as e:
-        try:
-            with open(os.path.join(OUT_DIR, "last_error.txt"), "w", encoding="utf-8") as f:
-                f.write(str(e))
-        except Exception:
-            pass
-        return f"<pre>Error generating JSON:\n{e}\nCheck /out/last_error.txt for details.</pre>", 400
-
-# Nice-to-have: GETs on these endpoints just bounce back to the form
-@app.get("/generate")
-@app.get("/generate_json")
-def get_generate_redirect():
-    return ('<meta http-equiv="refresh" content="0; url=/" />', 302, {"Location": "/"})
+    return render_template_string(INDEX_HTML)
 
 @app.get("/out/<path:filename>")
 def get_file(filename):
     try:
+        # as_attachment=True so browsers treat it as a download
         return send_from_directory(OUT_DIR, filename, as_attachment=True)
     except Exception:
         abort(404)
 
+@app.post("/generate")
+def generate():
+    url = request.form.get("url", "").strip()
+    transcript_text = (request.form.get("transcript") or "").strip()
+    fmt = (request.form.get("format") or "txt").strip().lower()
+    if fmt not in ("txt","pdf"):
+        fmt = "txt"
+    try:
+        abs_path, file_name = build_and_write_json_file(url, provided_transcript=transcript_text or None, fmt=fmt)
+        return render_template_string(
+            SUCCESS_HTML,
+            file_url=f"/out/{file_name}",
+            file_name=file_name,
+        )
+    except Exception as e:
+        try:
+            with open(os.path.join(OUT_DIR, "last_error.txt"), "w", encoding="utf-8") as f:
+                f.write("Error: " + str(e))
+        except Exception:
+            pass
+        return f"<pre>Error generating JSON:\n{e}\nCheck /out/last_error.txt for details.</pre>", 400
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT","8080")), debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
