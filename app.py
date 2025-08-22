@@ -393,40 +393,37 @@ RESULT_HTML = """
 </body>
 </html>
 """
-
 # ─────────────────────── Routes ────────────────────────
 @app.get("/health")
 def health():
     return "ok", 200
 
+# Update the form to post to /generate (see INDEX_HTML in your file if needed)
 @app.get("/")
 def index():
-    return render_template_string(INDEX_HTML)
+    return render_template_string(INDEX_HTML.replace('action="/generate_json"', 'action="/generate"'))
 
-@app.get("/out/<path:filename>")
-def get_file(filename):
-    try:
-        return send_from_directory(OUT_DIR, filename, as_attachment=True)
-    except Exception:
-        abort(404)
-
-@app.post("/generate_json")
-def generate_json():
+def _handle_generate_json():
     url = request.form.get("url","").strip()
     transcript_text = (request.form.get("transcript") or "").strip()
+    data = build_debranded_json(url, transcript_text or None)
+    base = data.get("id") or safe_token("case_study")
+    fname = f"{base}.json"
+    fpath = os.path.join(OUT_DIR, fname)
+    with open(fpath, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return render_template_string(
+        RESULT_HTML,
+        json_url=f"/out/{fname}",
+        json_filename=fname,
+        json_preview=json.dumps(data, ensure_ascii=False, indent=2)[:100000]
+    )
+
+# Accept BOTH endpoints so old links/buttons still work
+@app.post("/generate")
+def generate_route():
     try:
-        data = build_debranded_json(url, transcript_text or None)
-        base = data.get("id") or safe_token("case_study")
-        fname = f"{base}.json"
-        fpath = os.path.join(OUT_DIR, fname)
-        with open(fpath, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        return render_template_string(
-            RESULT_HTML,
-            json_url=f"/out/{fname}",
-            json_filename=fname,
-            json_preview=json.dumps(data, ensure_ascii=False, indent=2)[:100000]
-        )
+        return _handle_generate_json()
     except Exception as e:
         try:
             with open(os.path.join(OUT_DIR, "last_error.txt"), "w", encoding="utf-8") as f:
@@ -434,6 +431,31 @@ def generate_json():
         except Exception:
             pass
         return f"<pre>Error generating JSON:\n{e}\nCheck /out/last_error.txt for details.</pre>", 400
+
+@app.post("/generate_json")
+def generate_json_route():
+    try:
+        return _handle_generate_json()
+    except Exception as e:
+        try:
+            with open(os.path.join(OUT_DIR, "last_error.txt"), "w", encoding="utf-8") as f:
+                f.write(str(e))
+        except Exception:
+            pass
+        return f"<pre>Error generating JSON:\n{e}\nCheck /out/last_error.txt for details.</pre>", 400
+
+# Nice-to-have: GETs on these endpoints just bounce back to the form
+@app.get("/generate")
+@app.get("/generate_json")
+def get_generate_redirect():
+    return ('<meta http-equiv="refresh" content="0; url=/" />', 302, {"Location": "/"})
+
+@app.get("/out/<path:filename>")
+def get_file(filename):
+    try:
+        return send_from_directory(OUT_DIR, filename, as_attachment=True)
+    except Exception:
+        abort(404)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8080")), debug=True)
