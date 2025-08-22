@@ -190,148 +190,178 @@ def gather_trade_snippets(title: str) -> Dict[str, List[str]]:
         if c not in dedup_cites: dedup_cites.append(c)
     return {"snippets": snips, "citations": dedup_cites[:8]}
 
-# ─────────────── LLM JSON builder (STRICT) ─────────────
-SYSTEM_JSON = """
-You are a fact-locked ad analyst. Return ONLY valid JSON for a case study with this schema:
-{
-  "id": string,                       // slug (a-z0-9-_)
-  "category": string,                 // generic category (e.g., "Candy")
-  "title": string,                    // debranded title
-  "source_url": string,               // the YouTube URL
-  "summary": string,                  // 2-3 sentences
-  "breakdown_beats": [                // 4-10 beats
-    {
-      "timecode": "m:ss m:ss",
-      "dialogue": [string],
-      "visuals": string,
-      "provenance": ["transcript"|"source_verified_visuals"|"press"],
-      "notes": string
-    }
-  ],
-  "visuals_montage_sourced": [        // only if supported by thumbnails or press snippets
-    { "description": string, "provenance": ["source_verified_visuals"|"press"] }
-  ],
-  "why_its_good": {
-    "strategy": [string], "craft": [string], "communication": [string]
-  },
-  "how_to_reuse_big_idea": [string],
-  "verbatim_transcript": [ { "timecode": "m:ss", "text": string } ],
-  "debranding_rules": [ { "from": string, "to": string } ],
-  "schema_version": 1,
-  "generated_at": ISO_8601_string
-}
+# ───────────────────── LLM JSON GEN (with montage visuals) ─────────────────────
+from openai import OpenAI
+def _llm_client():
+    return OpenAI()  # uses OPENAI_API_KEY
+
+SOURCE_PRIORITY_PROMPT = """
+You are a fact-locked ad analyst. Output ONLY JSON.
+
+EVIDENCE PRIORITY (strict):
+1) SOURCE_VERIFIED_VISUALS = things clearly visible in the provided thumbnails (and consistent with transcript audio).
+2) transcript_audio        = exact lines heard in the transcript/captions you receive.
+3) trade_press             = facts quoted from the provided research snippets/links (if any).
+4) inferred_low            = only if weakly suggested; avoid when unsure.
 
 RULES:
-- Do not guess. If visual actions are not clearly implied by transcript or thumbnails, omit them.
-- Keep "provenance" honest: "transcript" for VO lines; "source_verified_visuals" only if the visual is evident in thumbnails; "press" only if supported by the provided press snippets.
-- Debrand: Replace brand/product names with generic category terms given in the prompt.
-- Output JSON only; no markdown, no commentary.
-"""
+- If it’s not clearly supported by evidence, DO NOT include it.
+- For `visuals_montage_sourced`, include ONLY on-screen actions you can confidently verify from the thumbnails/transcript. If you are not sure an action appears on-screen, DO NOT list it.
+- Never invent props, wardrobe, names, or counts.
+- Timecode everything you can. Dialog lines MUST be substrings of the transcript; if not 100% certain, omit them.
+- Use short, concrete, filmic wording. No generic phrases like “people react”.
 
-def build_debranded_json(youtube_url: str, pasted_transcript: Optional[str]) -> Dict:
-    client = get_client()
+OUTPUT JSON SCHEMA (return exactly this shape):
+{
+  "meta": {
+    "title": "string",
+    "channel": "string",
+    "url": "string"
+  },
+  "big_idea": "string",
+  "beat_map": [
+    {
+      "label": "string",
+      "time_start": "MM:SS",
+      "time_end": "MM:SS",
+      "vo_or_dialog": [ "verbatim lines from transcript only" ],
+      "visual": "what we SEE (short, concrete). If not visible, omit.",
+      "provenance": ["source_verified_visuals" | "transcript_audio" | "trade_press" | "inferred_low"]
+    }
+  ],
+  "dialogs": [
+    { "time": "MM:SS", "line": "verbatim from transcript" }
+  ],
+  "visuals_montage_sourced": [
+    {
+      "description": "on-screen action (short, concrete)",
+      "provenance": ["source_verified_visuals"]
+    }
+  ],
+  "sources": [
+    "optional trade-press urls you actually used"
+  ]
+}
+
+VALIDATION:
+- `visuals_montage_sourced` must include ONLY actions you can SEE in thumbnails (and that do not contradict transcript). If you can’t verify a stunt is on-screen, leave it out.
+- If thumbnails don’t show enough, the array can be empty.
+- No Markdown, no commentary, JSON only.
+""".strip()
+
+def _vision_user_payload(youtube_url: str, video_title: str, channel: str,
+                         transcript_text: str, image_urls: List[str],
+                         research_snips: List[str], research_urls: List[str]) -> List[dict]:
+    # Vision + text content for GPT-4o
+    parts: List[dict] = []
+    for u in image_urls:
+        parts.append({"type": "image_url", "image_url": {"url": u}})
+    text = [
+        f"Title: {video_title}",
+        f"Channel: {channel}",
+        f"URL: {youtube_url}",
+        "",
+    ]
+    if research_snips:
+        text.append("Trade-press snippets (for factual context only):")
+        for s in research_snips[:8]:
+            text.append(f"• {s}")
+        if research_urls:
+            text.append("Links:")
+            for u in research_urls[:8]:
+                text.append(f"- {u}")
+        text.append("")
+    text.append("Transcript (verbatim):")
+    text.append(transcript_text)
+    parts.append({"type": "text", "text": "\n".join(text)})
+    return parts
+
+def _gpt_json(system_prompt: str, user_payload: List[dict]) -> dict:
+    client = _llm_client()
+    resp = client.chat.completions.create(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+        response_format={"type": "json_object"},
+        messages=[
+            {"role":"system","content": system_prompt},
+            {"role":"user","content": user_payload},
+        ],
+        temperature=0.3,   # accuracy first
+        max_tokens=2200,
+    )
+    txt = resp.choices[0].message.content or "{}"
+    try:
+        return json.loads(txt)
+    except Exception:
+        # permissive fallback
+        start = txt.find("{"); end = txt.rfind("}")
+        return json.loads(txt[start:end+1]) if start != -1 and end != -1 else {}
+
+def build_debranded_json(youtube_url: str, provided_transcript: Optional[str]) -> dict:
+    """
+    Build the JSON payload with a hard-required `visuals_montage_sourced` list that only
+    contains on-screen, source-verified actions.
+    """
+    # 1) Basic meta
     vid = video_id_from_url(youtube_url)
     meta = fetch_basic_metadata(vid)
-    title = meta.get("title","") or "Untitled"
-    channel = meta.get("author","") or "Unknown"
+    title = meta.get("title", "") or "Untitled Spot"
+    channel = meta.get("author", "") or "Unknown Channel"
 
-    # Transcript
-    transcript_text = (pasted_transcript or "").strip()
-    if not transcript_text:
-        transcript_text = fetch_transcript_text(vid)
+    # 2) Transcript
+    if provided_transcript and provided_transcript.strip():
+        transcript_text = provided_transcript.strip()[:30000]
+    else:
+        segs = fetch_transcript_segments(vid)
+        if not segs:
+            segs = [{"start": 0.0, "text": ""}]
+        transcript_text = " ".join(s.get("text","") for s in segs)[:30000]
 
-    # Thumbnails for light vision grounding
-    thumbs = get_video_thumbnails(youtube_url, max_imgs=3)
-    vision_parts = [{"type":"image_url","image_url":{"url":u}} for u in thumbs]
+    # 3) Thumbnails (visual evidence)
+    thumbs = get_video_thumbnails(youtube_url, max_imgs=4)
 
-    # Optional trade press snippets (as textual evidence only)
-    trade = gather_trade_snippets(title)
-    trade_snips = trade.get("snippets", [])
-    trade_cites = trade.get("citations", [])
+    # 4) Light trade-press context (optional)
+    trade = enrich_from_trades_for_prompt(title, brand_hint=title)
+    research_snips = trade.get("snippets", [])
+    research_urls  = trade.get("citations", [])
 
-    # Debranding rules we want the model to respect
-    debrand_rules = [{"from": r["from"], "to": r["to"]} for r in DEBRAND_RULES]
-
-    # Choose a generic category + debranded title seed
-    generic_category = "Candy"
-    # crude debrand seed for title
-    de_title = title
-    for rule in DEBRAND_RULES:
-        de_title = re.sub(rule["from"], rule["to"], de_title)
-    if de_title == title:
-        de_title = f"{generic_category} — {title}"
-
-    # Build user content (multimodal)
-    research_block = ""
-    if trade_snips:
-        research_block = "Press snippets (for provenance='press' only):\n" + "\n".join(f"• {s}" for s in trade_snips)
-        if trade_cites:
-            research_block += "\nCitations:\n" + "\n".join(f"- {u}" for u in trade_cites)
-
-    user_text = f"""
-CATEGORY: {generic_category}
-DEBRANDED_TITLE_SEED: {de_title}
-SOURCE_URL: {youtube_url}
-CHANNEL: {channel}
-
-TRANSCRIPT (verbatim/auto; may be imperfect):
-{transcript_text[:20000]}
-
-{research_block}
-
-DEBRANDING_RULES (apply in wording):
-{json.dumps(debrand_rules, ensure_ascii=False)}
-"""
-
-    content = []
-    if vision_parts: content.extend(vision_parts)
-    content.append({"type":"text","text":user_text})
-
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role":"system","content":SYSTEM_JSON},{"role":"user","content":content}],
-        response_format={"type":"json_object"},
-        temperature=0.2,     # accuracy-first
-        max_tokens=2200
+    # 5) Ask model for JSON
+    user_payload = _vision_user_payload(
+        youtube_url=youtube_url,
+        video_title=title,
+        channel=channel,
+        transcript_text=transcript_text,
+        image_urls=thumbs,
+        research_snips=research_snips,
+        research_urls=research_urls,
     )
-    data = json.loads(resp.choices[0].message.content or "{}")
+    data = _gpt_json(SOURCE_PRIORITY_PROMPT, user_payload)
 
-    # Post-process: ensure debranding substitutions across text fields
-    def _debrand_inplace(obj):
-        if isinstance(obj, dict):
-            for k,v in obj.items():
-                obj[k] = _debrand_inplace(v)
-        elif isinstance(obj, list):
-            return [_debrand_inplace(x) for x in obj]
-        elif isinstance(obj, str):
-            s = obj
-            for rule in DEBRAND_RULES:
-                s = re.sub(rule["from"], rule["to"], s)
-            return s
-        return obj
+    # 6) Post-validate minimal fields and constrain montage provenance
+    data.setdefault("meta", {}).update({"title": title, "channel": channel, "url": youtube_url})
+    data.setdefault("big_idea", "")
+    data.setdefault("beat_map", [])
+    data.setdefault("dialogs", [])
+    data.setdefault("visuals_montage_sourced", [])
+    data.setdefault("sources", research_urls[:8])
 
-    data = _debrand_inplace(data)
+    # Enforce montage items to be strictly source_verified_visuals or drop them
+    clean_montage = []
+    for item in data.get("visuals_montage_sourced", []):
+        desc = (item or {}).get("description", "").strip()
+        prov = [p for p in (item or {}).get("provenance", []) if p == "source_verified_visuals"]
+        if desc and prov:
+            clean_montage.append({"description": desc, "provenance": ["source_verified_visuals"]})
+    data["visuals_montage_sourced"] = clean_montage
 
-    # Ensure required top fields
-    if not data.get("id"):
-        data["id"] = safe_token(f"{generic_category}_{vid}")[:80]
-    if not data.get("category"):
-        data["category"] = generic_category
-    if not data.get("title"):
-        data["title"] = de_title
-    if not data.get("source_url"):
-        data["source_url"] = youtube_url
-    data["schema_version"] = 1
-    data["generated_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+    # Lightweight hallucination guard on montage (ban these words without verified visuals)
+    banned = re.compile(r"\b(wearing|shirt|tie|named|boyfriend|girlfriend|manager|influencer|exactly\s*\d+)\b", re.I)
+    data["visuals_montage_sourced"] = [
+        it for it in data["visuals_montage_sourced"]
+        if not banned.search(it.get("description",""))
+    ]
 
-    # Attach the debranding rules we actually used (human-readable)
-    data["debranding_rules"] = [{"from": r["from"], "to": r["to"]} for r in DEBRAND_RULES]
-
-    # Attach trade citations if missing but we used snippets
-    if trade_cites and not data.get("why_its_good"):
-        data["why_its_good"] = {"strategy":[],"craft":[],"communication":[]}
-    if trade_cites:
-        data.setdefault("_citations", trade_cites)  # aux field (optional)
+    # 7) Stable id for file name
+    data["id"] = safe_token(f"{title or 'case_study'}_{vid}")
     return data
 
 # ─────────────────── HTML Templates ────────────────────
